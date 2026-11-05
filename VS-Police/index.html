@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#1a2332" />
+<meta name="mobile-web-app-capable" content="yes" />
+<title>VS Police - 警察 vs 逃走者</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="app">
+
+    <!-- ============ 3カラムレイアウト ============ -->
+    <main id="main">
+
+        <!-- ===== 左カラム：タイトルバー／フェーズ／ラウンド ===== -->
+        <header id="header">
+            <div class="header-top">
+                <h1 class="title">🚁 VS Police <span class="subtitle">警察 vs 逃走車</span></h1>
+                <div id="phase-indicator" class="phase-indicator">
+                    <span id="phase-label">フェーズ</span>
+                    <span id="turn-label" class="turn-label">--</span>
+                </div>
+            </div>
+
+            <!-- ラウンドトラック 1〜11 -->
+            <div id="round-track" class="round-track" aria-label="ラウンドトラック">
+                <!-- JSで動的に生成 -->
+            </div>
+
+            <!-- 開示された痕跡（警察ビューのみ表示） -->
+            <div class="panel-block police-only" id="left-clues">
+                <h2 class="panel-title">🔎 発見した痕跡</h2>
+                <div id="clues-revealed" class="clues-revealed">
+                    <span class="clue-empty">まだ痕跡は見つかっていません</span>
+                </div>
+            </div>
+
+            <div class="panel-block" id="left-legend">
+                <h2 class="panel-title">🗺 凡例</h2>
+                <ul class="legend">
+                    <li><span class="lg-dot yellow"></span>黄＝R1 の潜伏地点</li>
+                    <li><span class="lg-dot red"></span>赤＝R6 の通過点</li>
+                    <li><span class="lg-dot blue"></span>青＝その他の痕跡</li>
+                    <li><span class="lg-ico">🚁</span>光る交差点＝移動</li>
+                    <li><span class="lg-ico">🟡</span>光るビル＝捜索</li>
+                </ul>
+            </div>
+        </header>
+
+        <!-- ===== 中央カラム：盤面（最大化） ===== -->
+        <section id="board-section">
+            <div id="board-container">
+                <!-- ビル 5x5 グリッド -->
+                <div id="buildings-layer" class="buildings-layer">
+                    <!-- JSで動的に生成 -->
+                </div>
+                <!-- 交差点 4x4 グリッド (重ねレイヤー) -->
+                <div id="intersections-layer" class="intersections-layer">
+                    <!-- JSで動的に生成 -->
+                </div>
+                <!-- サーチライトレイヤー -->
+                <div id="searchlight-layer" class="searchlight-layer"></div>
+            </div>
+        </section>
+
+        <!-- コントロール・情報パネル -->
+        <aside id="control-panel">
+            <!-- 現在の操作案内（右カラム上部・常時固定） -->
+            <div id="hint-bar" class="hint-bar">
+                <span class="hint-icon" aria-hidden="true">👉</span>
+                <span id="help-text" class="help-text">
+                    ヘリを選択し、移動または捜索を行ってください。
+                </span>
+            </div>
+            <div id="panel-scroll">
+            <div class="panel-block police-only">
+                <h2 class="panel-title">💂 警察コマンド</h2>
+                <div id="police-sub-indicator" class="police-sub-indicator" style="display:none;"></div>
+                <div id="heli-status" class="heli-status">
+                    <!-- JSで動的に生成 -->
+                </div>
+                <div id="heli-buttons" class="heli-buttons">
+                    <button class="btn btn-heli" data-heli="0">🚁 緑</button>
+                    <button class="btn btn-heli" data-heli="1">🚁 桃</button>
+                    <button class="btn btn-heli" data-heli="2">🚁 黄</button>
+                </div>
+            </div>
+
+            <div class="panel-block">
+                <h2 class="panel-title">📋 ログ</h2>
+                <div id="log-area" class="log-area" aria-live="polite">
+                    <div class="log-entry">ゲームを開始します。</div>
+                </div>
+            </div>
+            </div>
+
+            <!-- 親指で届く固定フッター（主アクション） -->
+            <div id="panel-footer">
+                <button id="btn-end-police-turn" class="btn btn-end-turn police-only">🚁 警察ターン終了</button>
+            </div>
+        </aside>
+    </main>
+
+    <!-- ==================== ブラインドオーバーレイ ==================== -->
+    <div id="blind-overlay" class="blind-overlay hidden">
+        <div class="blind-content">
+            <div class="blind-icon">🙈</div>
+            <h2 id="blind-title" class="blind-title">警察は目を離してください</h2>
+            <p id="blind-message" class="blind-message">
+                犯人が移動します。準備ができたら下のボタンを押してください。
+            </p>
+            <button id="blind-confirm-btn" class="btn btn-blind-confirm">準備完了</button>
+        </div>
+    </div>
+
+    <!-- ==================== スプラッシュ / INIT ==================== -->
+    <div id="splash-screen" class="splash-screen">
+        <div class="splash-inner">
+            <h1 class="splash-title">🚁 VS POLICE 🚗</h1>
+            <p class="splash-sub">『VS Police』Web版</p>
+            <div class="splash-desc">
+                <p>非対称対戦ボードゲームをブラウザで完全再現。</p>
+                <p><strong>警察側</strong>: ヘリ3機で逃走車を探し出す。<br>
+                   <strong>犯人側</strong>: 11ラウンド逃げ切る。</p>
+                <p class="mode-hint">📱 1台の端末で2〜3人が交代して遊ぶ「パス＆プレイ」形式</p>
+            </div>
+            <div class="splash-buttons">
+                <button id="btn-start-pvp" class="btn btn-start">👥 2人で対戦 (犯人1 vs 警察1)</button>
+                <button id="btn-start-3p" class="btn btn-start btn-3p">👥👥 3人で対戦 (犯人1 vs 警察2)</button>
+                <button id="btn-start-cpu" class="btn btn-start btn-alt">🤖 警察ソロプレイ（犯人CPU）</button>
+                <button id="btn-start-cpu-police" class="btn btn-start btn-cpu-police">🚗 犯人ソロプレイ（警察CPU）</button>
+            </div>
+            <div class="splash-rules">
+                <details>
+                    <summary>📖 ルールを見る</summary>
+                    <div class="rules-body">
+                        <h3>ゲームの流れ</h3>
+                        <ol>
+                            <li>警察: ヘリ3機を交差点に配置</li>
+                            <li>犯人: 逃走車をビルに潜伏配置</li>
+                            <li>Round 1〜11 を繰り返す</li>
+                        </ol>
+                        <h3>警察フェーズ</h3>
+                        <ul>
+                            <li>各ヘリが「移動」または「捜索」を1回ずつ</li>
+                            <li>捜索: 隣接する4ビルのうち1棟をめくる</li>
+                            <li>車が見つかったら警察の勝利</li>
+                        </ul>
+                        <h3>犯人フェーズ</h3>
+                        <ul>
+                            <li>逃走車を隣接する未訪問ビルへ1マス移動</li>
+                            <li>直前のビルに痕跡チップを置く</li>
+                            <li>移動先がなければ警察の勝利</li>
+                        </ul>
+                        <h3>痕跡チップ</h3>
+                        <ul>
+                            <li>🟡 黄: Round 1 の潜伏開始地点</li>
+                            <li>🔴 赤: Round 6 の通過点</li>
+                            <li>🔵 青: その他ラウンド (2〜5, 7〜11)</li>
+                        </ul>
+                        <h3>勝利条件</h3>
+                        <ul>
+                            <li>👮 警察: 車を見つける、または犯人を手詰まりにする</li>
+                            <li>🚗 犯人: 11ラウンド生き延びる</li>
+                        </ul>
+                    </div>
+                </details>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== ゲームオーバー ==================== -->
+    <div id="gameover-modal" class="gameover-modal hidden">
+        <div class="gameover-content">
+            <div id="gameover-icon" class="gameover-icon">🏆</div>
+            <h2 id="gameover-title" class="gameover-title">ゲーム終了</h2>
+            <p id="gameover-message" class="gameover-message"></p>
+            <div class="gameover-buttons">
+                <button id="btn-review-route" class="btn btn-secondary">🎬 逃走ルートを再生</button>
+                <button id="btn-replay" class="btn btn-primary">🔄 もう一度</button>
+                <button id="btn-to-splash" class="btn btn-secondary">🏠 タイトル</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== ルート再生モーダル ==================== -->
+    <div id="route-modal" class="route-modal hidden">
+        <div class="route-content">
+            <h2>🎬 逃走ルート振り返り</h2>
+            <canvas id="route-canvas" width="400" height="400"></canvas>
+            <div class="route-controls">
+                <button id="btn-route-play" class="btn btn-primary">▶ 再生</button>
+                <button id="btn-route-close" class="btn btn-secondary">✖ 閉じる</button>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<!-- ==================== 横画面推奨ヒント（縦持ちタブレット向け） ==================== -->
+<div id="rotate-hint" class="rotate-hint" role="dialog" aria-label="表示方向のご案内">
+    <div class="rotate-hint-inner">
+        <div class="rotate-icon" aria-hidden="true">🔄</div>
+        <h2>横画面がおすすめ</h2>
+        <p>タブレットを横にすると、盤面を大きく使えてタップもしやすくなります。</p>
+        <button id="btn-rotate-close" class="btn btn-rotate-close">このまま縦で遊ぶ</button>
+    </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
