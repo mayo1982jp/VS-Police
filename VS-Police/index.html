@@ -2,9 +2,15 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<!-- ズーム可能にする（WCAG 1.4.4 準拠。ダブルタップズームは touch-action: manipulation で抑止済み） -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 <meta name="theme-color" content="#1a2332" />
 <meta name="mobile-web-app-capable" content="yes" />
+<meta name="description" content="ヘリコプターで逃走車を追跡する非対称対戦ボードゲーム『VS Police』のブラウザ版。サーバー不要・2〜3人のパス&プレイやCPU対戦に対応。" />
+<meta property="og:title" content="VS Police - 警察 vs 逃走者" />
+<meta property="og:description" content="シティチェイスを完全再現。ブラウザだけで動く警察vs犯人の対戦パズル。" />
+<meta property="og:type" content="website" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%9A%81%3C/text%3E%3C/svg%3E" />
 <title>VS Police - 警察 vs 逃走者</title>
 <link rel="stylesheet" href="style.css" />
 </head>
@@ -45,6 +51,7 @@
                     <li><span class="lg-dot blue"></span>青＝その他の痕跡</li>
                     <li><span class="lg-ico">🚁</span>光る交差点＝移動</li>
                     <li><span class="lg-ico">🟡</span>光るビル＝捜索</li>
+                    <li><span class="lg-ico">✔</span>✔のビル＝空確定。ただし車は再進入可能</li>
                 </ul>
             </div>
         </header>
@@ -104,7 +111,7 @@
     </main>
 
     <!-- ==================== ブラインドオーバーレイ ==================== -->
-    <div id="blind-overlay" class="blind-overlay hidden">
+    <div id="blind-overlay" class="blind-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="blind-title">
         <div class="blind-content">
             <div class="blind-icon">🙈</div>
             <h2 id="blind-title" class="blind-title">警察は目を離してください</h2>
@@ -172,7 +179,7 @@
     </div>
 
     <!-- ==================== ゲームオーバー ==================== -->
-    <div id="gameover-modal" class="gameover-modal hidden">
+    <div id="gameover-modal" class="gameover-modal hidden" role="dialog" aria-modal="true" aria-labelledby="gameover-title">
         <div class="gameover-content">
             <div id="gameover-icon" class="gameover-icon">🏆</div>
             <h2 id="gameover-title" class="gameover-title">ゲーム終了</h2>
@@ -186,9 +193,9 @@
     </div>
 
     <!-- ==================== ルート再生モーダル ==================== -->
-    <div id="route-modal" class="route-modal hidden">
+    <div id="route-modal" class="route-modal hidden" role="dialog" aria-modal="true" aria-labelledby="route-modal-title">
         <div class="route-content">
-            <h2>🎬 逃走ルート振り返り</h2>
+            <h2 id="route-modal-title">🎬 逃走ルート振り返り</h2>
             <canvas id="route-canvas" width="400" height="400"></canvas>
             <div class="route-controls">
                 <button id="btn-route-play" class="btn btn-primary">▶ 再生</button>
@@ -200,7 +207,7 @@
 </div>
 
 <!-- ==================== 横画面推奨ヒント（縦持ちタブレット向け） ==================== -->
-<div id="rotate-hint" class="rotate-hint" role="dialog" aria-label="表示方向のご案内">
+<div id="rotate-hint" class="rotate-hint" role="dialog" aria-modal="true" aria-label="表示方向のご案内">
     <div class="rotate-hint-inner">
         <div class="rotate-icon" aria-hidden="true">🔄</div>
         <h2>横画面がおすすめ</h2>

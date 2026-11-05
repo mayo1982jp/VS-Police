@@ -39,7 +39,6 @@
                     owner: is3p ? (i < 2 ? 0 : 1) : 0,  // 3pvp: 緑桃=A(0), 黄=B(1)
                 })),
                 selected: 0,
-                actionMode: 'move',
                 subPlayer: 0,   // 3pvp時の現在行動中の警察プレイヤー (0=A, 1=B)
             },
             buildings: Array.from({ length: B_SIZE }, (_, y) =>
@@ -55,14 +54,13 @@
 
     /* ---------- DOM ---------- */
     const $ = (sel) => document.querySelector(sel);
-    const $$ = (sel) => Array.from(document.querySelectorAll(sel));
     let boardContainer, buildingsLayer, intersectionsLayer, searchlightLayer;
     let roundTrackEl, phaseLabelEl, turnLabelEl, logAreaEl, helpTextEl, cluesRevealedEl;
     let heliStatusEl, heliButtonsEl, hintBarEl, btnEndPoliceTurn;
     let blindOverlay, blindTitle, blindMessage, blindConfirmBtn;
     let splashScreen, gameoverModal, gameoverIcon, gameoverTitle, gameoverMessage;
     let routeModal, routeCanvas;
-    let rotateHint, btnRotateClose;
+    let btnRotateClose;
 
     function cacheElements() {
         boardContainer     = $('#board-container');
@@ -90,7 +88,6 @@
         gameoverMessage = $('#gameover-message');
         routeModal      = $('#route-modal');
         routeCanvas     = $('#route-canvas');
-        rotateHint      = $('#rotate-hint');
         btnRotateClose  = $('#btn-rotate-close');
     }
 
@@ -189,12 +186,17 @@
     const clueLabel = { YELLOW: '黄', RED: '赤', BLUE: '青' };
 
     /* ---------- ログ ---------- */
+    const LOG_MAX = 200;
     function addLog(msg, cls = 'log-info') {
         S.logs.push({ msg, cls });
         const div = document.createElement('div');
         div.className = 'log-entry ' + cls;
         div.textContent = msg;
         logAreaEl.appendChild(div);
+        // 長時間プレイでもDOMが膨らまないよう上限で先頭を剪定
+        while (logAreaEl.children.length > LOG_MAX) {
+            logAreaEl.removeChild(logAreaEl.firstChild);
+        }
         logAreaEl.scrollTop = logAreaEl.scrollHeight;
     }
 
@@ -233,8 +235,9 @@
 
     function render() {
         // 犯人ターン中は警察専用パネルを畳んで盤面優先のレイアウトに
+        // （犯人ソロプレイの犯人フェーズも含まれる。警察ソロ＝cpuモードは警察ビュー維持）
         const thiefView = (S.phase === 'ROUND_THIEF' || S.phase === 'SETUP_THIEF')
-            && (S.mode === 'pvp' || S.mode === '3pvp');
+            && S.mode !== 'cpu';
         document.body.classList.toggle('thief-view', thiefView);
         renderRoundTrack();
         renderPhaseIndicator();
@@ -559,6 +562,8 @@
             return;
         }
         if (S.phase === 'ROUND_POLICE') {
+            // 犯人ソロプレイの警察フェーズは CPU の手番。盤面タップで横やりできないようロック
+            if (S.mode === 'cpu_police' || S.transitioning) return;
             const heli = S.police.helis[S.police.selected];
             if (!heli || heli.hasActed || heli.x == null) return;
             const targets = searchableBuildings(heli);
@@ -592,6 +597,8 @@
             return;
         }
         if (S.phase === 'ROUND_POLICE') {
+            // CPU 手番中は移動・選択切替も不可
+            if (S.mode === 'cpu_police' || S.transitioning) return;
             const heli = S.police.helis[S.police.selected];
             // その交差点にいるヘリ自体をタップ → 選択切替（タブレットで押しやすい）
             const parked = S.police.helis.find(h => h.x === ix && h.y === iy);
@@ -611,6 +618,7 @@
 
     function onHeliSelect(index) {
         if (S.phase !== 'ROUND_POLICE' && S.phase !== 'SETUP_POLICE') return;
+        if (S.phase === 'ROUND_POLICE' && (S.mode === 'cpu_police' || S.transitioning)) return;
         const heli = S.police.helis[index];
         if (!heli) return;
         if (S.phase === 'ROUND_POLICE') {
@@ -662,7 +670,10 @@
         S.thief.carX = bx; S.thief.carY = by;
         S.thief.visited.add(key(bx, by));
         S.thief.path.push({ round: 0, x: bx, y: by });
-        addLog(`逃走車を (${bx},${by}) に潜伏配置。`, 'log-thief');
+        // 警察ソロプレイでは潜伏位置をログに残さない（READ可能な情報漏洩防止）
+        addLog(S.mode === 'cpu'
+            ? '🤖 CPU が逃走車を潜伏させた（位置は秘密）。'
+            : `逃走車を (${bx},${by}) に潜伏配置。`, 'log-thief');
         render();
         if (S.mode === 'cpu' || S.mode === 'cpu_police') {
             startRound(1);
@@ -709,10 +720,10 @@
             }
         } else {
             addLog(`   → 何もない (確定)。`, 'log-info');
+            showSearchResultBadge(bx, by); // 「いない」バッジは空振りのときのみ（痕跡発見時はチップを隠さない）
         }
         autoSelectNextHeli();
         render();
-        showSearchResultBadge(bx, by);
         maybeEndPolicePhase();
     }
 
@@ -737,7 +748,8 @@
 
     function maybeEndPolicePhase() {
         if (S.transitioning) return;
-        const allActed = S.police.helis.every(h => h.hasActed || h.x == null);
+        // ROUND_POLICE 時点では全ヘリ配置済みのはずなので hasActed のみで判定する
+        const allActed = S.police.helis.every(h => h.hasActed);
         if (allActed && S.winner == null) {
             S.transitioning = true;
             render();
@@ -797,7 +809,10 @@
         S.thief.carX = nx; S.thief.carY = ny;
         S.thief.visited.add(key(nx, ny));
         S.thief.path.push({ round: round, x: nx, y: ny });
-        addLog(`逃走車が (${ox},${oy}) → (${nx},${ny}) へ移動。痕跡「${clueLabel[clue]}」を落下。`, 'log-thief');
+        // 警察ソロプレイでは移動先座標をログに出さない（警察プレイヤーが読めるため秘匿が必要）
+        addLog(S.mode === 'cpu'
+            ? `Round ${round}：逃走車が移動した（移動先は警察には伏せられる）。`
+            : `逃走車が (${ox},${oy}) → (${nx},${ny}) へ移動。痕跡「${clueLabel[clue]}」を落下。`, 'log-thief');
         render();
         // 次のラウンドへ
         advanceRound();
@@ -902,6 +917,8 @@
         blindConfirmBtn.textContent = confirmLabel;
         blindOverlay.classList.remove('hidden');
         blindConfirmBtn.onclick = () => { buzz(16); cb(); };
+        // キーボードユーザーも即確定できるようフォーカスを運ぶ
+        blindConfirmBtn.focus({ preventScroll: true });
     }
     function hideBlind() {
         blindOverlay.classList.add('hidden');
@@ -928,6 +945,9 @@
                 gameoverTitle.textContent = '犯人の勝利!';
                 gameoverMessage.textContent = '11ラウンドにわたり逃走しきりました!';
             }
+            // モーダル表示直後は操作ボタンへフォーカス
+            const focusBtn = document.getElementById('btn-replay');
+            if (focusBtn) focusBtn.focus({ preventScroll: true });
         }, 400);
     }
 
@@ -1031,20 +1051,29 @@
 
             const targets = searchableBuildings(heli);
             const moves = validHeliMoves(heli);
+            const unsearched = targets.filter(t => !S.buildings[t.y][t.x].isSearched);
 
-            if (targets.length > 0) {
-                // 捜索: 最良のビルを選択
-                const best = pickBestSearchTarget(targets);
+            if (unsearched.length > 0) {
+                // 未捜索の隣接ビルがあるなら捜索
+                const best = pickBestSearchTarget(unsearched);
                 setTimeout(() => {
                     doSearch(heli, best.x, best.y);
                     if (S.winner == null) setTimeout(nextHeli, 700);
                     else S.transitioning = false;
                 }, 500);
             } else if (moves.length > 0) {
-                // 移動: 最良の交差点へ
+                // 周囲が捜索済みなら、未捜索ビルが多い交差点へ移動
                 const best = pickBestMoveTarget(moves);
                 setTimeout(() => {
                     doMoveHeli(heli, best.x, best.y);
+                    if (S.winner == null) setTimeout(nextHeli, 700);
+                    else S.transitioning = false;
+                }, 500);
+            } else if (targets.length > 0) {
+                // 身動き不可: 再捜索でカバー
+                const best = pickBestSearchTarget(targets);
+                setTimeout(() => {
+                    doSearch(heli, best.x, best.y);
                     if (S.winner == null) setTimeout(nextHeli, 700);
                     else S.transitioning = false;
                 }, 500);
@@ -1091,10 +1120,18 @@
     /* ==========================================================
        逃走ルート再生アニメ
        ========================================================== */
+    let routePlayTimer = null; // 連打による多重再生チェーン防止用
     function showRouteReplay() {
+        if (routePlayTimer) { clearTimeout(routePlayTimer); routePlayTimer = null; }
         routeModal.classList.remove('hidden');
+        // devicePixelRatio に合わせて輪郭鮮明に描画
+        const scale = Math.min(2, window.devicePixelRatio || 1);
+        const LOGICAL = 400;
+        routeCanvas.width = LOGICAL * scale;
+        routeCanvas.height = LOGICAL * scale;
         const ctx = routeCanvas.getContext('2d');
-        const W = routeCanvas.width, H = routeCanvas.height;
+        ctx.setTransform(scale, 0, 0, scale, 0, 0);
+        const W = LOGICAL, H = LOGICAL;
         const cell = W / B_SIZE;
         // 背景
         ctx.fillStyle = '#2c3a4d';
@@ -1155,9 +1192,9 @@
             ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
             ctx.fillText(String(vacateRound), cx, cy);
             idx++;
-            setTimeout(play, 480);
+            routePlayTimer = setTimeout(play, 480);
         };
-        setTimeout(play, 250);
+        routePlayTimer = setTimeout(play, 250);
     }
 
     /* ==========================================================
@@ -1203,7 +1240,10 @@
         $('#btn-replay').addEventListener('click', () => startGame(S.mode));
         $('#btn-to-splash').addEventListener('click', resetToSplash);
         $('#btn-review-route').addEventListener('click', showRouteReplay);
-        $('#btn-route-close').addEventListener('click', () => routeModal.classList.add('hidden'));
+        $('#btn-route-close').addEventListener('click', () => {
+            if (routePlayTimer) { clearTimeout(routePlayTimer); routePlayTimer = null; }
+            routeModal.classList.add('hidden');
+        });
         $('#btn-route-play').addEventListener('click', showRouteReplay);
 
         // ヘリセレクト
@@ -1219,6 +1259,24 @@
                 buzz(12);
             });
         }
+
+        // Esc でルート再生モーダルのみ閉じる（勝敗モーダルは誤閉じ防止に残す）
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && routeModal && !routeModal.classList.contains('hidden')) {
+                if (routePlayTimer) { clearTimeout(routePlayTimer); routePlayTimer = null; }
+                routeModal.classList.add('hidden');
+            }
+        });
+
+        // ゲーム中の誤リロード・タブ閉じ防止（タブレットでのスワイプ事故など）
+        window.addEventListener('beforeunload', (e) => {
+            const inGame = S && S.phase !== 'GAME_OVER'
+                && splashScreen && splashScreen.classList.contains('hidden');
+            if (inGame) {
+                e.preventDefault();
+                e.returnValue = '';
+            }
+        });
 
         // タブレットでの長押し（コンテキストメニュー・選択UI）を抑止
         boardContainer.addEventListener('contextmenu', (e) => e.preventDefault());
