@@ -1858,6 +1858,13 @@
             if (building.clueRevealed) continue;          // 痕跡マスは現在位置になり得ない
             if (isSearchedThisRound(b.x, b.y)) continue;  // 同ラウンドの再捜索は無意味
             const ck = b.y * B_SIZE + b.x;
+            // 痕跡が1つも出ていない間は、捜索済みマスを再捜索しない。
+            // 未捜索マスは「過去に立ち寄ったか」の痕跡情報まで得られるが、
+            // 捜索済みマスは直後だと現在位置の確認にしかならず情報が増えない。
+            // カバー範囲を広げて最初の痕跡を引きにいく方針（tanaka の指定）。
+            // 終盤候補マス（現在位置候補として捜すマス）は対象外。
+            const isEndgameCandidate = !!(endgame && endgame.candidateKeys.has(ck));
+            if (building.isSearched && S.revealedClues.length === 0 && !isEndgameCandidate) continue;
             const value = searchValueForCell(ck, post, endgame);
             actions.push({ type: 'search', target: { x: b.x, y: b.y }, cellKey: ck, value });
         }
@@ -2493,8 +2500,12 @@
                     branches.get(cls).push(path);
                 }
                 // 発見の価値には通常プランと同じ鮮度係数を掛け、捜索済みマスの
-                // 繰り返し捜索が先読みでも過大評価されないようにする
-                const freshness = searchFreshnessFactor(S.buildings[t.y][t.x]);
+                // 繰り返し捜索が先読みでも過大評価されないようにする。
+                // 痕跡がまだ出ていない間は、通常プランと同様に再捜索の発見価値を0にする
+                const searchedBuilding = S.buildings[t.y][t.x];
+                const freshness = (S.revealedClues.length === 0 && searchedBuilding.isSearched)
+                    ? 0
+                    : searchFreshnessFactor(searchedBuilding);
                 let acc = (hitCount / total) * WIN_VALUE * freshness;
                 for (const branch of branches.values()) {
                     acc += (branch.length / total) * rec(branch, positions, k + 1);
