@@ -16,8 +16,8 @@
     ];
 
     /* ---------- シード付き乱数（再現性のある検証用） ---------- */
-    // ?seed=123 で固定、?seed=random でページ読み込みごとにランダム。
-    // 未指定時は固定シード。startGame のたびに同じ初期値へ戻す。
+    // ?seed=123 で固定（startGame のたびに同じ初期値へ戻し、再現可能）。
+    // ?seed=random と未指定時（通常プレイ）は startGame ごとに新しいシード。
     const SEED_PARAM = (typeof location !== 'undefined' && location.search)
         ? new URLSearchParams(location.search).get('seed')
         : null;
@@ -2761,8 +2761,17 @@
     /* ==========================================================
        初期化・イベント紐付け
        ========================================================== */
+    let gameSeedCounter = 0;
     function startGame(mode) {
-        seedRandom(INITIAL_SEED);
+        // シード未指定（通常プレイ）と ?seed=random のときは、ゲームごとに
+        // 違うシードにする。これをしないと初期配置などが毎回同じになる。
+        // ?seed=数値 の検証時は従来どおり毎回同じシードで再現可能に保つ。
+        if (SEED_PARAM == null || SEED_PARAM === 'random') {
+            gameSeedCounter += 1;
+            seedRandom((Date.now() + Math.imul(gameSeedCounter, 0x9E3779B9)) >>> 0);
+        } else {
+            seedRandom(INITIAL_SEED);
+        }
         S = createState(mode);
         document.body.classList.remove('thief-view');
         splashScreen.classList.add('hidden');
