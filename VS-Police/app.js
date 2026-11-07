@@ -1584,10 +1584,16 @@
 
     /* ---------- 事後分布を使った警察CPUの意思決定 ---------- */
     // タスク1: 情報利得の重み。infoGain は bit 単位（最大 log2(25)≈4.64）。
-    // 痕跡ゼロでは発見確率が最大でも約7%しかなく、勝敗は最初の痕跡を引く速さで
-    // 決まるため、序盤は情報利得を発見確率より大きく評価する。残りラウンドが
-    // 減るほど情報を使う機会が減るので線形に減衰させ、R11 では 0 にする。
-    const INFO_GAIN_WEIGHT = 0.55;
+    // 痕跡ゼロでは発見確率が最大でも約7%しかなく、痕跡を引く速さは重要だが、
+    // bit から勝率への換算は間接的なので重みは中程度に抑える（0.55 だと捜索の
+    // 価値が移動の価値を常時上回り、ヘリが同じ窓に張り付いて同じマスを
+    // 繰り返し捜索する不具合があった）。残りラウンドが減るほど情報を使う
+    // 機会が減るので線形に減衰させ、R11 では 0 にする。
+    const INFO_GAIN_WEIGHT = 0.45;
+    // 移動で新しく捜索可能になるマス群の価値の係数。窓の外の候補は、誰かが
+    // 移動しない限り永遠に捜索できないため、「次ラウンドにそのマスを捜索
+    // できる選択肢」自体に価値を持たせる（planJointActions の統合スコアで使用）。
+    const NEW_WINDOW_WEIGHT = 0.5;
     function infoWeightForRound(round) {
         return INFO_GAIN_WEIGHT * (TOTAL_ROUNDS - round) / (TOTAL_ROUNDS - 1);
     }
@@ -1814,20 +1820,40 @@
         return plan;
     }
 
+    /* 再捜索の鮮度係数。空振りした直後のマスは「犯人がその後に立ち寄った」
+       情報しか新しく得られず、同じ窓の同じマスを毎ラウンド捜索する価値はない。
+       前回捜索から 1 ラウンド後は 0.5、2 ラウンド後は 0.85、3 ラウンド以上で
+       元に戻る。終盤候補マス（今いる可能性で捜すマス）には適用しない。 */
+    function searchFreshnessFactor(building) {
+        if (!building || !building.isSearched || building.searchedRound == null) return 1;
+        const age = S.currentRound - building.searchedRound;
+        if (age <= 1) return 0.5;
+        if (age === 2) return 0.85;
+        return 1;
+    }
+
+    /* 1マスの捜索価値: 発見確率 + 情報利得（減衰）×鮮度 + 終盤ボーナス。 */
+    function searchValueForCell(ci, post, endgame) {
+        const x = ci % B_SIZE;
+        const y = (ci / B_SIZE) | 0;
+        let value = postProb(post, x, y);
+        if (post.infoGain) value += infoWeightForRound(S.currentRound) * (post.infoGain[ci] || 0);
+        const isEndgameCandidate = !!(endgame && endgame.candidateKeys.has(ci));
+        if (!isEndgameCandidate) value *= searchFreshnessFactor(S.buildings[y][x]);
+        if (isEndgameCandidate) value += ENDGAME_SEARCH_BONUS;
+        return value;
+    }
+
     /* 1機ぶんの候補手（捜索・移動）とその価値を列挙する。 */
     function generateHeliActions(heli, post, endgame) {
         const actions = [];
-        // タスク1: 捜索価値 = 発見確率 + 情報利得（ラウンドで減衰）+ 終盤ボーナス
-        const infoW = infoWeightForRound(S.currentRound);
         for (const b of searchableBuildings(heli)) {
             if (b.x < 0 || b.y < 0 || b.x >= B_SIZE || b.y >= B_SIZE) continue;
             const building = S.buildings[b.y][b.x];
             if (building.clueRevealed) continue;          // 痕跡マスは現在位置になり得ない
             if (isSearchedThisRound(b.x, b.y)) continue;  // 同ラウンドの再捜索は無意味
             const ck = b.y * B_SIZE + b.x;
-            let value = postProb(post, b.x, b.y);
-            if (post.infoGain) value += infoW * (post.infoGain[ck] || 0);
-            if (endgame && endgame.candidateKeys.has(ck)) value += ENDGAME_SEARCH_BONUS;
+            const value = searchValueForCell(ck, post, endgame);
             actions.push({ type: 'search', target: { x: b.x, y: b.y }, cellKey: ck, value });
         }
 
@@ -1907,8 +1933,49 @@
         let bestScore = -Infinity;
         const chosen = new Array(helis.length);
 
-        function evaluate(idx, searchedKeys, moveTargets, score) {
+        // 統合スコア: プラン全体を同じ物差しで評価する。
+        // 旧方式（捜索は絶対値、移動は微小な差分を足し合わせる）では捜索が
+        // 常時勝ち、ヘリが移動せず同じマスを繰り返し捜索していた。
+        // ここでは「移動はプラン完了後の配置で決まる次ラウンドの価値」として
+        // 葉でまとめて数える。R11 は次ラウンドが無いので移動の価値は 0。
+        const futureFactor = S.currentRound >= TOTAL_ROUNDS ? 0 : 1;
+        const allStartPositions = S.police.helis
+            .filter(h => h.x != null)
+            .map(h => ({ x: h.x, y: h.y, index: h.index }));
+        const windowCellsOf = (positions) => {
+            const set = new Set();
+            for (const p of positions) {
+                for (const b of adjacentBuildings(p.x, p.y)) {
+                    if (b.x >= 0 && b.y >= 0 && b.x < B_SIZE && b.y < B_SIZE) {
+                        set.add(b.y * B_SIZE + b.x);
+                    }
+                }
+            }
+            return set;
+        };
+        const startWindow = windowCellsOf(allStartPositions);
+
+        function leafScore(searchScore, finalPosByIndex) {
+            let score = searchScore;
+            if (futureFactor && post.propagated) {
+                const finalPositions = allStartPositions.map(p =>
+                    finalPosByIndex.has(p.index) ? finalPosByIndex.get(p.index) : p);
+                // 次ラウンド分布に対する最適割当の発見確率
+                score += MOVE_DISCOUNT * assignmentCapture(finalPositions, post.propagated);
+                // 新しく窓に入るマスを次ラウンドに捜索できる選択肢の価値
+                const finalWindow = windowCellsOf(finalPositions);
+                let newWindowValue = 0;
+                for (const ci of finalWindow) {
+                    if (!startWindow.has(ci)) newWindowValue += searchValueForCell(ci, post, endgame);
+                }
+                score += NEW_WINDOW_WEIGHT * newWindowValue;
+            }
+            return score;
+        }
+
+        function evaluate(idx, searchedKeys, moveTargets, searchScore, finalPosByIndex) {
             if (idx === helis.length) {
+                const score = leafScore(searchScore, finalPosByIndex);
                 if (score > bestScore + 1e-9) {
                     bestScore = score;
                     bestCombo = chosen.slice();
@@ -1916,9 +1983,10 @@
                 return;
             }
             for (const action of actionLists[idx]) {
-                let add = 0;
                 let nextSearched = searchedKeys;
                 let nextMoves = moveTargets;
+                let nextFinalPos = finalPosByIndex;
+                let add = 0;
                 if (action.type === 'search') {
                     if (searchedKeys.has(action.cellKey)) {
                         add = -0.02; // 同じマスの重複捜索は避ける
@@ -1930,18 +1998,18 @@
                 } else if (action.type === 'move') {
                     const mk = action.target.y * I_SIZE + action.target.x;
                     if (moveTargets.has(mk)) continue; // 同時に同じ交差点へは移動不可
-                    add = action.value;
                     nextMoves = new Set(moveTargets);
                     nextMoves.add(mk);
-                } else {
-                    add = action.value;
+                    nextFinalPos = new Map(finalPosByIndex);
+                    nextFinalPos.set(helis[idx].index, { x: action.target.x, y: action.target.y, index: helis[idx].index });
+                    // 移動自体の価値は葉の統合スコアで数える（ここでは加算しない）
                 }
                 chosen[idx] = action;
-                evaluate(idx + 1, nextSearched, nextMoves, score + add);
+                evaluate(idx + 1, nextSearched, nextMoves, searchScore + add, nextFinalPos);
             }
         }
 
-        evaluate(0, new Set(), new Set(), 0);
+        evaluate(0, new Set(), new Set(), 0, new Map());
         return { actions: bestCombo || [], score: bestScore };
     }
 
