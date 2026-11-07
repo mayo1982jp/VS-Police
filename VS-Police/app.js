@@ -775,6 +775,16 @@
                     chip.textContent = clueLabel[b.clue];
                     el.appendChild(chip);
                     el.classList.add('thief-visited');
+                    // 犯人ソロ: 未発見の痕跡はグレーアウトし、警察に発見された
+                    // 痕跡は通常表示のまま赤線で囲んで区別する
+                    if (S.mode === 'cpu_police') {
+                        if (b.clueRevealed) {
+                            el.classList.add('clue-discovered');
+                        } else {
+                            chip.classList.add('clue-undiscovered');
+                            el.classList.add('thief-visited-undiscovered');
+                        }
+                    }
                 }
                 // 警察に開示された痕跡 (clueRevealed) は常時表示
                 if (!isThiefView && b.clueRevealed) {

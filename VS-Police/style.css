@@ -406,6 +406,21 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
     outline-offset: -4px;
 }
 
+/* 犯人ソロ: 未発見の痕跡はグレーアウト */
+.clue-chip.clue-undiscovered {
+    filter: grayscale(1);
+    opacity: 0.5;
+}
+.building.thief-visited-undiscovered {
+    outline-color: rgba(160, 160, 160, 0.45);
+}
+
+/* 犯人ソロ: 警察に発見された痕跡は赤線で囲む */
+.building.clue-discovered {
+    outline: 3px solid #ff1744;
+    outline-offset: -3px;
+}
+
 /* ---------- Intersection cells ---------- */
 .intersection {
     grid-column-end: span 1;
