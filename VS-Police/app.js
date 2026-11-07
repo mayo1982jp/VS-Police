@@ -802,6 +802,11 @@
                     const car = document.createElement('div');
                     car.className = 'car-icon';
                     car.textContent = '🚗';
+                    // 犯人ソロ: 警察ターン中は車をグレーアウトする
+                    // （犯人が操作するターンのみ通常表示）
+                    if (S.mode === 'cpu_police' && S.phase === 'ROUND_POLICE') {
+                        car.classList.add('car-grayed');
+                    }
                     el.appendChild(car);
                     if (b.clue) {
                         // 車と痕跡が重なる場合は痕跡を上に

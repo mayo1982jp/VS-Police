@@ -421,6 +421,12 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
     outline-offset: -3px;
 }
 
+/* 犯人ソロ: 警察ターン中の車はグレーアウト */
+.car-icon.car-grayed {
+    filter: grayscale(1);
+    opacity: 0.5;
+}
+
 /* ---------- Intersection cells ---------- */
 .intersection {
     grid-column-end: span 1;
