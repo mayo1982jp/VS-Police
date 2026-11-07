@@ -237,14 +237,22 @@
         return `${state.currentRound}|${clues}|${empties}`;
     }
 
-    /* 返り値: { counts, total, probs, cells }
+    /* 返り値: { counts, total, probs, cells, visitProb, visitByIndex, infoGain }
        counts[cell] = そのマスで終わる整合経路数
        probs[cell]  = counts / total
-       cells        = 確率降順の { x, y, p } 配列 */
+       cells        = 確率降順の { x, y, p } 配列
+       visitProb[ci]        = そのマスが過去（index <= R-2）に訪問された確率（痕跡がある確率）
+       visitByIndex[ci*11+i]= そのマスが index i に訪問された確率
+       infoGain[ci]         = そのマスを捜索したときの終点分布エントロピーの期待減少量（bit） */
     function thiefPosterior(state = S) {
         const N = B_SIZE * B_SIZE;
         const counts = new Float64Array(N);
-        const emptyResult = { counts, total: 0, probs: new Float64Array(N), cells: [] };
+        const emptyResult = {
+            counts, total: 0, probs: new Float64Array(N), cells: [],
+            visitProb: new Float64Array(N),
+            visitByIndex: new Float64Array(N * 11),
+            infoGain: new Float64Array(N),
+        };
         if (!state || !state.currentRound) return emptyResult;
 
         const R = state.currentRound;
@@ -307,17 +315,44 @@
         const allCluesMask = clueAllowed.length === 0 ? 0 : (1 << clueAllowed.length) - 1;
         const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
         let total = 0;
+        // タスク1用: 経路スタックと、訪問/捜索結果分岐の集計
+        // outcomeCounts[(ci*5+cls)*N + endpoint]: cls 0=発見 1=黄 2=赤 3=青 4=空
+        const pathStack = [];
+        const visitCounts = new Float64Array(N);
+        const visitByIndexCounts = new Float64Array(N * 11);
+        const outcomeCounts = new Float64Array(N * 5 * N);
 
         function dfs(idx, pos, visitedMask, satisfiedMask) {
+            pathStack.push(pos);
             // 満たせなくなる痕跡を枝刈り
             for (let k = 0; k < clueAllowed.length; k++) {
-                if ((satisfiedMask & (1 << k)) === 0 && clueMaxIdx[k] < idx) return;
+                if ((satisfiedMask & (1 << k)) === 0 && clueMaxIdx[k] < idx) { pathStack.pop(); return; }
             }
             if (idx === maxIdx) {
                 if (satisfiedMask === allCluesMask) {
                     counts[pos] += 1;
                     total += 1;
+                    // 過去訪問（痕跡）の集計
+                    for (let i = 0; i < maxIdx; i++) {
+                        const ci = pathStack[i];
+                        visitCounts[ci] += 1;
+                        visitByIndexCounts[ci * 11 + i] += 1;
+                    }
+                    // 捜索結果の分岐ごとに終点を集計（期待情報利得の計算用）
+                    for (let c = 0; c < N; c++) {
+                        let cls;
+                        if (c === pos) cls = 0;
+                        else {
+                            const ii = pathStack.indexOf(c);
+                            if (ii < 0 || ii >= maxIdx) cls = 4;
+                            else if (ii === 0) cls = 1;
+                            else if (ii === 5) cls = 2;
+                            else cls = 3;
+                        }
+                        outcomeCounts[(c * 5 + cls) * N + pos] += 1;
+                    }
                 }
+                pathStack.pop();
                 return;
             }
             const x = pos % B_SIZE;
@@ -338,6 +373,7 @@
                 }
                 dfs(nextIdx, np, visitedMask | (1 << np), ns);
             }
+            pathStack.pop();
         }
 
         const startCandidates = [];
@@ -381,7 +417,41 @@
             }
         }
         cells.sort((a, b) => b.p - a.p || a.y - b.y || a.x - b.x);
-        return { counts, total, probs, cells };
+
+        // タスク1: 訪問確率と期待情報利得（total=0 のフォールバック時はすべて 0）
+        const visitProb = new Float64Array(N);
+        const visitByIndex = new Float64Array(N * 11);
+        const infoGain = new Float64Array(N);
+        if (total > 0) {
+            for (let i = 0; i < N; i++) visitProb[i] = visitCounts[i] / total;
+            for (let i = 0; i < N * 11; i++) visitByIndex[i] = visitByIndexCounts[i] / total;
+            let hNow = 0;
+            for (let i = 0; i < N; i++) {
+                if (probs[i] > 0) hNow -= probs[i] * Math.log2(probs[i]);
+            }
+            for (let c = 0; c < N; c++) {
+                let expected = 0;
+                for (let cls = 0; cls < 5; cls++) {
+                    const base = (c * 5 + cls) * N;
+                    let clsTotal = 0;
+                    for (let e = 0; e < N; e++) clsTotal += outcomeCounts[base + e];
+                    if (clsTotal <= 0) continue;
+                    const pCls = clsTotal / total;
+                    if (cls === 0) continue; // 発見なら終点は確定（エントロピー 0）
+                    let h = 0;
+                    for (let e = 0; e < N; e++) {
+                        const cnt = outcomeCounts[base + e];
+                        if (cnt > 0) {
+                            const p = cnt / clsTotal;
+                            h -= p * Math.log2(p);
+                        }
+                    }
+                    expected += pCls * h;
+                }
+                infoGain[c] = Math.max(0, hNow - expected);
+            }
+        }
+        return { counts, total, probs, cells, visitProb, visitByIndex, infoGain };
     }
 
     function getPosterior(state = S) {
@@ -395,6 +465,182 @@
 
     function inferredCandidates(state = S) {
         return getPosterior(state).cells.slice();
+    }
+
+    /* ==========================================================
+       タスク2: 整合経路そのものの列挙と伝播分析
+       終点集計では失われる「訪問済み集合」の情報を保持し、
+       次ラウンドの分布・強制移動先・手詰まり確率を導く。
+       ========================================================== */
+    const PATHS_CACHE = { key: null, result: null };
+
+    /* thiefPosterior と同じ制約で、整合する経路（セルindexの配列）を全て返す。 */
+    function enumerateConsistentPaths(state = S) {
+        const N = B_SIZE * B_SIZE;
+        if (!state || !state.currentRound) return [];
+        const R = state.currentRound;
+        const maxIdx = R - 1;
+        if (maxIdx < 0) return [];
+
+        const clueAt = new Int16Array(N).fill(-1);
+        const clueAllowed = [];
+        const clueMaxIdx = [];
+        const seenClueCells = new Set();
+        for (const c of state.revealedClues || []) {
+            if (c.x < 0 || c.x >= B_SIZE || c.y < 0 || c.y >= B_SIZE) continue;
+            const ci = c.y * B_SIZE + c.x;
+            if (seenClueCells.has(ci)) continue;
+            seenClueCells.add(ci);
+            let allowedIndices;
+            if (c.type === 'YELLOW') allowedIndices = [0];
+            else if (c.type === 'RED') allowedIndices = [5];
+            else allowedIndices = [1, 2, 3, 4, 6, 7, 8, 9, 10];
+            let mask = 0;
+            let maxAllowed = -1;
+            for (const i of allowedIndices) {
+                if (i <= maxIdx - 1) {
+                    mask |= (1 << i);
+                    if (i > maxAllowed) maxAllowed = i;
+                }
+            }
+            if (mask === 0) continue;
+            clueAt[ci] = clueAllowed.length;
+            clueAllowed.push(mask);
+            clueMaxIdx.push(maxAllowed);
+        }
+        const forbiddenUntil = new Int8Array(N).fill(-1);
+        for (const s of state.searchLog || []) {
+            if (s.result !== 'empty') continue;
+            const i = s.round - 1;
+            if (i < 0 || i > maxIdx) continue;
+            const ci = s.y * B_SIZE + s.x;
+            if (i > forbiddenUntil[ci]) forbiddenUntil[ci] = i;
+        }
+        let forcedStart = -1;
+        for (let ci = 0; ci < N; ci++) {
+            if (clueAt[ci] >= 0 && (clueAllowed[clueAt[ci]] & 1)) { forcedStart = ci; break; }
+        }
+        const allCluesMask = clueAllowed.length === 0 ? 0 : (1 << clueAllowed.length) - 1;
+        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+        const paths = [];
+        const stack = [];
+
+        function dfs(idx, pos, visitedMask, satisfiedMask) {
+            stack.push(pos);
+            for (let k = 0; k < clueAllowed.length; k++) {
+                if ((satisfiedMask & (1 << k)) === 0 && clueMaxIdx[k] < idx) { stack.pop(); return; }
+            }
+            if (idx === maxIdx) {
+                if (satisfiedMask === allCluesMask) paths.push(stack.slice());
+                stack.pop();
+                return;
+            }
+            const x = pos % B_SIZE;
+            const y = (pos / B_SIZE) | 0;
+            const nextIdx = idx + 1;
+            for (const [dx, dy] of dirs) {
+                const nx = x + dx;
+                const ny = y + dy;
+                if (nx < 0 || ny < 0 || nx >= B_SIZE || ny >= B_SIZE) continue;
+                const np = ny * B_SIZE + nx;
+                if (visitedMask & (1 << np)) continue;
+                if (nextIdx <= forbiddenUntil[np]) continue;
+                let ns = satisfiedMask;
+                const clueIndex = clueAt[np];
+                if (clueIndex >= 0) {
+                    if ((clueAllowed[clueIndex] & (1 << nextIdx)) === 0) continue;
+                    ns |= (1 << clueIndex);
+                }
+                dfs(nextIdx, np, visitedMask | (1 << np), ns);
+            }
+            stack.pop();
+        }
+
+        const startCandidates = [];
+        if (forcedStart >= 0) startCandidates.push(forcedStart);
+        else for (let ci = 0; ci < N; ci++) startCandidates.push(ci);
+        for (const sp of startCandidates) {
+            if (forbiddenUntil[sp] >= 0) continue;
+            let sm = 0;
+            const clueIndex = clueAt[sp];
+            if (clueIndex >= 0) {
+                if ((clueAllowed[clueIndex] & 1) === 0) continue;
+                sm |= (1 << clueIndex);
+            }
+            dfs(0, sp, 1 << sp, sm);
+        }
+        return paths;
+    }
+
+    /* 経路集合から次ラウンド分布・手詰まり・強制移動先を導く。 */
+    function analyzeConsistentPaths(paths) {
+        const N = B_SIZE * B_SIZE;
+        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+        const nextCounts = new Float64Array(N);
+        const endpointCounts = new Float64Array(N);
+        const nextSetByEndpoint = new Map(); // endpoint ci -> Set(next ci)
+        let trapCount = 0;
+        for (const path of paths) {
+            const endpoint = path[path.length - 1];
+            endpointCounts[endpoint] += 1;
+            const visited = new Set(path);
+            const ex = endpoint % B_SIZE;
+            const ey = (endpoint / B_SIZE) | 0;
+            const moves = [];
+            for (const [dx, dy] of dirs) {
+                const nx = ex + dx;
+                const ny = ey + dy;
+                if (nx < 0 || ny < 0 || nx >= B_SIZE || ny >= B_SIZE) continue;
+                const np = ny * B_SIZE + nx;
+                if (!visited.has(np)) moves.push(np);
+            }
+            if (moves.length === 0) { trapCount += 1; continue; }
+            // 犯人が合法手から一様に選ぶ前提で次分布へ配分する
+            const w = 1 / moves.length;
+            let set = nextSetByEndpoint.get(endpoint);
+            if (!set) { set = new Set(); nextSetByEndpoint.set(endpoint, set); }
+            for (const m of moves) {
+                nextCounts[m] += w;
+                set.add(m);
+            }
+        }
+        const nonTrap = paths.length - trapCount;
+        const nextProbs = new Float64Array(N);
+        if (nonTrap > 0) {
+            for (let i = 0; i < N; i++) nextProbs[i] = nextCounts[i] / nonTrap;
+        }
+        const nextCells = [];
+        for (let ci = 0; ci < N; ci++) {
+            if (nextProbs[ci] > 0) {
+                nextCells.push({ x: ci % B_SIZE, y: (ci / B_SIZE) | 0, p: nextProbs[ci] });
+            }
+        }
+        nextCells.sort((a, b) => b.p - a.p || a.y - b.y || a.x - b.x);
+        const forcedByEndpoint = new Map();
+        for (const [endpoint, set] of nextSetByEndpoint) {
+            if (set.size === 1) forcedByEndpoint.set(endpoint, [...set][0]);
+        }
+        return {
+            total: paths.length,
+            trapCount,
+            trapProb: paths.length > 0 ? trapCount / paths.length : 0,
+            endpointCounts,
+            nextCounts,
+            nextProbs,
+            propagated: { probs: nextProbs, cells: nextCells, total: nonTrap, counts: nextCounts },
+            forcedByEndpoint,
+        };
+    }
+
+    function getPathAnalysis(state = S) {
+        const key = posteriorSignature(state);
+        if (PATHS_CACHE.key === key && PATHS_CACHE.result) return PATHS_CACHE.result;
+        const paths = enumerateConsistentPaths(state);
+        const analysis = analyzeConsistentPaths(paths);
+        const result = { paths, analysis, propagated: analysis.propagated, forcedByEndpoint: analysis.forcedByEndpoint };
+        PATHS_CACHE.key = key;
+        PATHS_CACHE.result = result;
+        return result;
     }
 
     /* ---------- ログ ---------- */
@@ -1267,13 +1513,13 @@
         return 0;
     }
 
-    /* C(16,3)=560 通りを全探索し、全ビルへの最大捜索距離を最小化する。
-       副次評価として合計距離・即時捜索可能数・マンハッタン距離も見る。 */
-    function chooseMinimaxHeliSetup() {
+    /* C(16,3)=560 通りを全探索し、全候補の評価値を集める。 */
+    function enumerateMinimaxSetups() {
         const intersections = [];
         for (let y = 0; y < I_SIZE; y++)
             for (let x = 0; x < I_SIZE; x++)
                 intersections.push({ x, y });
+        const all = [];
         let best = null;
         for (let a = 0; a < intersections.length; a++) {
             for (let b = a + 1; b < intersections.length; b++) {
@@ -1300,15 +1546,32 @@
                     const candidate = {
                         combo, maxSearch, sumSearch, immediate, maxManhattan, sumManhattan
                     };
+                    all.push(candidate);
                     if (!best || compareMinimaxSetup(candidate, best) < 0) best = candidate;
                 }
             }
         }
-        return best;
+        return { all, best };
+    }
+
+    /* C(16,3)=560 通りを全探索し、全ビルへの最大捜索距離を最小化する。
+       副次評価として合計距離・即時捜索可能数・マンハッタン距離も見る。 */
+    function chooseMinimaxHeliSetup() {
+        return enumerateMinimaxSetups().best;
+    }
+
+    /* タスク3: 最適（maxSearch、次いで sumSearch が最良と同点）の配置が複数ある場合、
+       その中からシード付き乱数で1つ選ぶ。決定的配置だと犯人（人間）が毎回
+       「裏」の潜伏位置を選べてしまうため。 */
+    function chooseRandomMinimaxHeliSetup() {
+        const { all, best } = enumerateMinimaxSetups();
+        const ties = all.filter(c => c.maxSearch === best.maxSearch && c.sumSearch === best.sumSearch);
+        if (ties.length <= 1) return best;
+        return ties[randInt(ties.length)];
     }
 
     function cpuSetupHeli() {
-        const setup = chooseMinimaxHeliSetup();
+        const setup = chooseRandomMinimaxHeliSetup();
         const positions = setup.combo;
         S.police.helis.forEach((h, i) => {
             h.x = positions[i].x;
@@ -1320,16 +1583,162 @@
     }
 
     /* ---------- 事後分布を使った警察CPUの意思決定 ---------- */
-    const SEARCH_INFO_BONUS = 0.06;      // 未捜索ビルを開ける情報価値
-    const MOVE_DISCOUNT = 0.8;           // 移動して次ラウンドに捜索する価値の割引
-    const MOVE_INFO_WEIGHT = 0.02;       // 移動先の未捜索ビル1つあたりの情報価値
-    const MOVE_DIST_PENALTY = 0.01;      // 候補から遠い移動へのペナルティ
-    const MOVE_APPROACH_BONUS = 0.10;    // 候補に1手近づく価値
+    // タスク1: 情報利得の重み。infoGain は bit 単位（最大 log2(25)≈4.64）。
+    // 痕跡ゼロでは発見確率が最大でも約7%しかなく、勝敗は最初の痕跡を引く速さで
+    // 決まるため、序盤は情報利得を発見確率より大きく評価する。残りラウンドが
+    // 減るほど情報を使う機会が減るので線形に減衰させ、R11 では 0 にする。
+    const INFO_GAIN_WEIGHT = 0.55;
+    function infoWeightForRound(round) {
+        return INFO_GAIN_WEIGHT * (TOTAL_ROUNDS - round) / (TOTAL_ROUNDS - 1);
+    }
+    // タスク3: 混合分布の係数。経路数比例だけだと「経路数の少ない歩き方」を
+    // わざと選ぶ人間相手に系統的に外すため、一様分布（整合マス全体）と
+    // 相手モデルを混ぜて下限を作る。
+    const MIX_COUNT = 0.60;              // 経路数比例の事後分布
+    const MIX_SUPPORT = 0.25;            // 整合マスへの一様分布
+    const MIX_OPPONENT = 0.15;           // 相手モデル（逃走 prior で重み付けした経路分布）
+    const PROB_FLOOR = 0.005;            // 整合マスの確率下限（完全な無視を防ぐ）
+    const OPP_STEP_WEIGHT = 0.05;        // 相手モデルの1ステップあたり重み（弱く効かせる）
+    const MOVE_DISCOUNT = 0.8;           // 次ラウンドの発見確率を今の価値に割り引く係数
+    const MOVE_DIST_PENALTY = 0.01;      // 次候補から遠い移動へのペナルティ
+    const FORCED_COVER_BONUS = 0.30;     // 強制移動先を新たに捜索可能にする移動の価値
     const ENDGAME_SEARCH_BONUS = 0.35;   // 終盤で候補マスを捜索する価値
     const ENDGAME_MOVE_BONUS = 0.08;     // 終盤で候補マスに近づく移動の価値
+    // タスク4: 終盤ソルバーの発動上限（経路数が多い序盤では読み切れないため）
+    const SOLVER_MAX_PATHS = 500;
+    const SOLVER_NODE_LIMIT = 30000;     // 探索ノード数の上限（超えたら諦めて通常評価へ）
 
     function postProb(post, x, y) {
         return post.probs[y * B_SIZE + x] || 0;
+    }
+
+    /* ヘリ群（交差点座標の配列）が分布 post に対して達成できる
+       「1機につき隣接4マスのうち最大1マス」を条件とした最適割当の発見確率。
+       findCurrentPhaseCoveragePlan の重み付き一般化。 */
+    function assignmentCapture(positions, post) {
+        if (!post || !post.probs || positions.length === 0) return 0;
+        const options = positions.map(p => {
+            const list = [null];
+            for (const b of adjacentBuildings(p.x, p.y)) {
+                if (b.x < 0 || b.y < 0 || b.x >= B_SIZE || b.y >= B_SIZE) continue;
+                const pr = post.probs[b.y * B_SIZE + b.x] || 0;
+                if (pr > 0) list.push({ cell: b.y * B_SIZE + b.x, p: pr });
+            }
+            return list;
+        });
+        let bestSum = 0;
+        const used = new Set();
+        function rec(i, sum) {
+            if (i === options.length) {
+                if (sum > bestSum) bestSum = sum;
+                return;
+            }
+            for (const opt of options[i]) {
+                if (opt === null) { rec(i + 1, sum); continue; }
+                if (used.has(opt.cell)) continue;
+                used.add(opt.cell);
+                rec(i + 1, sum + opt.p);
+                used.delete(opt.cell);
+            }
+        }
+        rec(0, 0);
+        return bestSum;
+    }
+
+    /* タスク3: 相手モデル分布。経路ごとに「ヘリから遠い・壁際・逃げ道が多い」
+       ステップを選んだ経路ほど重くし、終点分布にする。ヘリの過去位置履歴は
+       状態に無いため、現在のヘリ位置で近似する（係数は弱く、単独では
+       経路数比例の分布を逆転させない）。 */
+    function opponentProbsFromPaths(paths, helis) {
+        const N = B_SIZE * B_SIZE;
+        const probs = new Float64Array(N);
+        if (!paths || paths.length === 0 || helis.length === 0) return null;
+        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+        let totalW = 0;
+        for (const path of paths) {
+            let w = 1;
+            const prefix = new Set([path[0]]);
+            for (let i = 1; i < path.length; i++) {
+                const ci = path[i];
+                const x = ci % B_SIZE;
+                const y = (ci / B_SIZE) | 0;
+                let minDist = Infinity;
+                for (const h of helis) {
+                    const d = Math.abs(x - h.x) + Math.abs(y - h.y);
+                    if (d < minDist) minDist = d;
+                }
+                const edge = (x === 0 || x === B_SIZE - 1 || y === 0 || y === B_SIZE - 1) ? 1 : 0;
+                let escape = 0;
+                for (const [dx, dy] of dirs) {
+                    const nx = x + dx;
+                    const ny = y + dy;
+                    if (nx < 0 || ny < 0 || nx >= B_SIZE || ny >= B_SIZE) continue;
+                    if (!prefix.has(ny * B_SIZE + nx)) escape++;
+                }
+                w *= 1 + OPP_STEP_WEIGHT * (0.3 * minDist + 0.5 * edge + 0.25 * escape);
+                prefix.add(ci);
+            }
+            probs[path[path.length - 1]] += w;
+            totalW += w;
+        }
+        if (totalW <= 0) return null;
+        for (let i = 0; i < N; i++) probs[i] /= totalW;
+        return probs;
+    }
+
+    const DECISION_POST_CACHE = { key: null, result: null };
+
+    /* 意思決定用の混合分布を作る（タスク3）。生の事後分布に
+       visitProb / visitByIndex / infoGain と経路分析を付けて返す。 */
+    function getDecisionPosterior(state = S) {
+        const helis = (state.police ? state.police.helis : S.police.helis)
+            .filter(h => h.x != null);
+        const key = posteriorSignature(state) + '|'
+            + helis.map(h => `${h.x},${h.y}`).join(';');
+        if (DECISION_POST_CACHE.key === key && DECISION_POST_CACHE.result) {
+            return DECISION_POST_CACHE.result;
+        }
+        const raw = getPosterior(state);
+        const { paths, analysis } = getPathAnalysis(state);
+        const N = B_SIZE * B_SIZE;
+        const support = [];
+        for (let ci = 0; ci < N; ci++) if (raw.probs[ci] > 0) support.push(ci);
+        const opp = opponentProbsFromPaths(paths, helis);
+        const probs = new Float64Array(N);
+        for (let ci = 0; ci < N; ci++) {
+            let p = MIX_COUNT * raw.probs[ci];
+            if (support.length > 0 && raw.probs[ci] > 0) p += MIX_SUPPORT / support.length;
+            if (opp) p += MIX_OPPONENT * opp[ci];
+            probs[ci] = p;
+        }
+        // 整合マスに下限を作ってから正規化する
+        let sum = 0;
+        for (const ci of support) {
+            if (probs[ci] < PROB_FLOOR) probs[ci] = PROB_FLOOR;
+        }
+        for (let ci = 0; ci < N; ci++) sum += probs[ci];
+        if (sum > 0) for (let ci = 0; ci < N; ci++) probs[ci] /= sum;
+        const cells = [];
+        for (let ci = 0; ci < N; ci++) {
+            if (probs[ci] > 0) {
+                cells.push({ x: ci % B_SIZE, y: (ci / B_SIZE) | 0, p: probs[ci] });
+            }
+        }
+        cells.sort((a, b) => b.p - a.p || a.y - b.y || a.x - b.x);
+        const result = {
+            ...raw,
+            probs,
+            cells,
+            rawProbs: raw.probs,
+            paths,
+            pathAnalysis: analysis,
+            propagated: analysis.propagated,
+            forcedByEndpoint: analysis.forcedByEndpoint,
+            mixed: true,
+        };
+        DECISION_POST_CACHE.key = key;
+        DECISION_POST_CACHE.result = result;
+        return result;
     }
 
     function isSearchedThisRound(x, y) {
@@ -1405,41 +1814,11 @@
         return plan;
     }
 
-    /* 候補が多すぎて覆えない場合の1手先読み。
-       犯人CPUの「ヘリから遠い・壁際を好む」方針で候補を再重み付けする。 */
-    function applyThiefEscapePrior(post) {
-        const candidates = post.cells.filter(c => c.p > 0);
-        if (candidates.length <= 1) return post;
-        const helis = S.police.helis.filter(h => h.x != null);
-        if (helis.length === 0) return post;
-        const probs = new Float64Array(B_SIZE * B_SIZE);
-        let total = 0;
-        for (const c of candidates) {
-            let minDist = Infinity;
-            for (const h of helis) {
-                const d = Math.abs(c.x - h.x) + Math.abs(c.y - h.y);
-                if (d < minDist) minDist = d;
-            }
-            const edge = (c.x === 0 || c.x === B_SIZE - 1 || c.y === 0 || c.y === B_SIZE - 1) ? 1 : 0;
-            const weight = c.p * (1 + 0.06 * (minDist + edge * 0.5));
-            probs[c.y * B_SIZE + c.x] = weight;
-            total += weight;
-        }
-        if (total <= 0) return post;
-        const cells = [];
-        for (let ci = 0; ci < probs.length; ci++) {
-            if (probs[ci] > 0) {
-                probs[ci] /= total;
-                cells.push({ x: ci % B_SIZE, y: (ci / B_SIZE) | 0, p: probs[ci] });
-            }
-        }
-        cells.sort((a, b) => b.p - a.p || a.y - b.y || a.x - b.x);
-        return { ...post, probs, cells, priorAdjusted: true };
-    }
-
     /* 1機ぶんの候補手（捜索・移動）とその価値を列挙する。 */
     function generateHeliActions(heli, post, endgame) {
         const actions = [];
+        // タスク1: 捜索価値 = 発見確率 + 情報利得（ラウンドで減衰）+ 終盤ボーナス
+        const infoW = infoWeightForRound(S.currentRound);
         for (const b of searchableBuildings(heli)) {
             if (b.x < 0 || b.y < 0 || b.x >= B_SIZE || b.y >= B_SIZE) continue;
             const building = S.buildings[b.y][b.x];
@@ -1447,46 +1826,62 @@
             if (isSearchedThisRound(b.x, b.y)) continue;  // 同ラウンドの再捜索は無意味
             const ck = b.y * B_SIZE + b.x;
             let value = postProb(post, b.x, b.y);
-            if (!building.isSearched) value += SEARCH_INFO_BONUS;
+            if (post.infoGain) value += infoW * (post.infoGain[ck] || 0);
             if (endgame && endgame.candidateKeys.has(ck)) value += ENDGAME_SEARCH_BONUS;
             actions.push({ type: 'search', target: { x: b.x, y: b.y }, cellKey: ck, value });
         }
 
-        const currentAdj = adjacentBuildings(heli.x, heli.y)
-            .filter(b => b.x >= 0 && b.y >= 0 && b.x < B_SIZE && b.y < B_SIZE);
-        let currentCoverage = 0, currentUnsearched = 0;
-        for (const b of currentAdj) {
-            currentCoverage += postProb(post, b.x, b.y);
-            if (!S.buildings[b.y][b.x].isSearched) currentUnsearched++;
+        // タスク2: 移動価値 = 次ラウンド分布に対する最適割当発見確率の増分。
+        // 「1機で最大1マス」を割当で数えるため、候補が1機の窓に固まる場合の
+        // 過大評価が起きない。
+        const propagated = post.propagated || null;
+        const allPositions = S.police.helis
+            .filter(h => h.x != null)
+            .map(h => ({ x: h.x, y: h.y, index: h.index }));
+        const baseCapture = propagated ? assignmentCapture(allPositions, propagated) : 0;
+        // 強制移動先（この移動で新たに捜索可能になると価値が高い）
+        const forcedTargets = new Set();
+        if (post.forcedByEndpoint) {
+            for (const nextCi of post.forcedByEndpoint.values()) forcedTargets.add(nextCi);
         }
-        let currentNearest = Infinity;
-        for (const c of post.cells) {
-            if (c.p <= 0) continue;
-            const d = searchDistanceForBuilding(c.x, c.y, heli.x, heli.y);
-            if (d < currentNearest) currentNearest = d;
-        }
-        if (!isFinite(currentNearest)) currentNearest = 0;
+        const searchableFrom = (ix, iy) => {
+            const set = new Set();
+            for (const b of adjacentBuildings(ix, iy)) {
+                if (b.x >= 0 && b.y >= 0 && b.x < B_SIZE && b.y < B_SIZE) {
+                    set.add(b.y * B_SIZE + b.x);
+                }
+            }
+            return set;
+        };
+        const currentSearchable = searchableFrom(heli.x, heli.y);
 
         for (const m of validHeliMoves(heli)) {
-            const adj = adjacentBuildings(m.x, m.y)
-                .filter(b => b.x >= 0 && b.y >= 0 && b.x < B_SIZE && b.y < B_SIZE);
-            let coverage = 0, unsearched = 0;
-            for (const b of adj) {
-                coverage += postProb(post, b.x, b.y);
-                if (!S.buildings[b.y][b.x].isSearched) unsearched++;
+            let value;
+            if (propagated) {
+                const afterPositions = allPositions.map(p =>
+                    p.index === heli.index ? { x: m.x, y: m.y, index: p.index } : p);
+                value = MOVE_DISCOUNT * (assignmentCapture(afterPositions, propagated) - baseCapture);
+                // 強制移動先を新たにカバーできる場合のボーナス
+                if (forcedTargets.size > 0 && propagated.probs) {
+                    const afterSearchable = searchableFrom(m.x, m.y);
+                    for (const fci of forcedTargets) {
+                        if (afterSearchable.has(fci) && !currentSearchable.has(fci)) {
+                            value += FORCED_COVER_BONUS * (propagated.probs[fci] || 0);
+                        }
+                    }
+                }
+                // 次候補から遠ざかる移動への小さなペナルティ
+                let nearest = Infinity;
+                for (const c of propagated.cells) {
+                    const d = searchDistanceForBuilding(c.x, c.y, m.x, m.y);
+                    if (d < nearest) nearest = d;
+                }
+                if (isFinite(nearest)) value -= MOVE_DIST_PENALTY * nearest;
+            } else {
+                value = 0;
             }
-            let nearest = Infinity;
-            for (const c of post.cells) {
-                if (c.p <= 0) continue;
-                const d = searchDistanceForBuilding(c.x, c.y, m.x, m.y);
-                if (d < nearest) nearest = d;
-            }
-            if (!isFinite(nearest)) nearest = 0;
-            let value = MOVE_DISCOUNT * (coverage - currentCoverage)
-                + MOVE_INFO_WEIGHT * (unsearched - currentUnsearched)
-                - MOVE_DIST_PENALTY * nearest
-                + MOVE_APPROACH_BONUS * Math.max(0, currentNearest - nearest);
             if (endgame && endgame.candidateKeys.size > 0) {
+                const adj = adjacentBuildings(m.x, m.y);
                 for (const b of adj) {
                     if (endgame.candidateKeys.has(b.y * B_SIZE + b.x)) {
                         value += ENDGAME_MOVE_BONUS;
@@ -1550,6 +1945,224 @@
         return { actions: bestCombo || [], score: bestScore };
     }
 
+    /* ---------- タスク4: 終盤の必勝読み切りソルバー ----------
+       belief（整合経路の集合）に対して
+       「警察の共同手 → 捜索結果の全分岐 → 犯人の全合法手（ユニオン）」
+       を終端まで辿り、どの分岐でも警察が勝てるプランを探す。
+       犯人の手と捜索結果は全て universal に扱うため、見つかったプランは
+       必勝である（健全性重視。見つからなければ通常評価にフォールバック）。 */
+    function solverBeliefPost(paths) {
+        const N = B_SIZE * B_SIZE;
+        const counts = new Float64Array(N);
+        for (const p of paths) counts[p[p.length - 1]] += 1;
+        const probs = new Float64Array(N);
+        if (paths.length > 0) {
+            for (let i = 0; i < N; i++) probs[i] = counts[i] / paths.length;
+        }
+        const cells = [];
+        for (let ci = 0; ci < N; ci++) {
+            if (probs[ci] > 0) cells.push({ x: ci % B_SIZE, y: (ci / B_SIZE) | 0, p: probs[ci] });
+        }
+        cells.sort((a, b) => b.p - a.p || a.y - b.y || a.x - b.x);
+        return { counts, total: paths.length, probs, cells };
+    }
+
+    /* ソルバー用の貪欲プラン: 確率の高い候補を重複なく捜索し、
+       届かないヘリは候補へ近づく。post は評価対象の分布（現在/伝播）。 */
+    function solverGreedyPlan(belief, positions, actingIdxs, post) {
+        const work = positions.map(p => ({ x: p.x, y: p.y }));
+        const usedCells = new Set();
+        const plan = [];
+        for (const hi of actingIdxs) {
+            const pos = work[hi];
+            let bestCell = null;
+            let bestP = 0;
+            for (const b of adjacentBuildings(pos.x, pos.y)) {
+                if (b.x < 0 || b.y < 0 || b.x >= B_SIZE || b.y >= B_SIZE) continue;
+                const ci = b.y * B_SIZE + b.x;
+                if (usedCells.has(ci)) continue;
+                const p = post.probs[ci] || 0;
+                if (p > bestP) { bestP = p; bestCell = b; }
+            }
+            if (bestCell) {
+                usedCells.add(bestCell.y * B_SIZE + bestCell.x);
+                plan.push({ type: 'search', target: { x: bestCell.x, y: bestCell.y } });
+                continue;
+            }
+            // 捜索できる候補がない: 候補に最も近づく合法移動
+            let bestMove = null;
+            let bestDist = Infinity;
+            for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+                const nx = pos.x + dx;
+                const ny = pos.y + dy;
+                if (nx < 0 || ny < 0 || nx >= I_SIZE || ny >= I_SIZE) continue;
+                if (work.some((w, wi) => wi !== hi && w.x === nx && w.y === ny)) continue;
+                let d = Infinity;
+                for (const c of post.cells) {
+                    const dd = searchDistanceForBuilding(c.x, c.y, nx, ny);
+                    if (dd < d) d = dd;
+                }
+                if (d < bestDist) { bestDist = d; bestMove = { x: nx, y: ny }; }
+            }
+            if (bestMove && bestDist < Infinity) {
+                work[hi] = bestMove;
+                plan.push({ type: 'move', target: bestMove });
+            } else {
+                plan.push({ type: 'wait', target: { x: pos.x, y: pos.y } });
+            }
+        }
+        return plan;
+    }
+
+    function findForcedWinPlan(remainingHelis) {
+        const { paths } = getPathAnalysis(S);
+        if (!paths || paths.length === 0) return null;
+        const rawPost = getPosterior(S);
+        const remainingPhases = TOTAL_ROUNDS - S.currentRound + 1;
+        const candidateCount = rawPost.cells.length;
+        // 発動条件: 経路が十分少ない終盤だけ（序盤は組み合わせが爆発するため）。
+        const triggered = paths.length <= SOLVER_MAX_PATHS
+            && (remainingPhases <= 4 || candidateCount <= 6 || paths.length <= 40);
+        if (!triggered) return null;
+
+        const allIdxs = S.police.helis.map(h => h.index);
+        const actingIdxs = remainingHelis.map(h => h.index);
+        const startPositions = S.police.helis.map(h => ({ x: h.x, y: h.y }));
+        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+        let nodes = 0;
+        const failMemo = new Set();
+        const ABORT = { solverAbort: true };
+
+        function beliefKey(belief, positions, round, acting) {
+            return belief.map(p => p.join(',')).sort().join('|')
+                + '#' + positions.map(p => `${p.x},${p.y}`).join(';')
+                + '#' + round + '#' + acting.join(',');
+        }
+
+        function candidatePlans(belief, positions, acting, round) {
+            const plans = [];
+            const seen = new Set();
+            const addPlan = (plan) => {
+                const k = JSON.stringify(plan.map(a => `${a.type}:${a.target.x},${a.target.y}`));
+                if (!seen.has(k)) { seen.add(k); plans.push(plan); }
+            };
+            const post = solverBeliefPost(belief);
+            addPlan(solverGreedyPlan(belief, positions, acting, post));
+            const prop = analyzeConsistentPaths(belief).propagated;
+            addPlan(solverGreedyPlan(belief, positions, acting, prop));
+            // 現在ラウンドだけは実状態と一致する共同プランも候補に入れる
+            if (round === S.currentRound) {
+                const fakeHelis = acting.map(hi => ({
+                    index: hi, x: positions[hi].x, y: positions[hi].y, hasActed: false,
+                }));
+                const joint = planJointActions(fakeHelis, getDecisionPosterior(S), null);
+                if (joint.actions && joint.actions.length === acting.length) {
+                    addPlan(joint.actions.map(a => ({
+                        type: a.type, target: { x: a.target.x, y: a.target.y },
+                    })));
+                }
+            }
+            return plans;
+        }
+
+        function applyActions(belief, positions, actions, k, round, acting) {
+            if (++nodes > SOLVER_NODE_LIMIT) throw ABORT;
+            if (k >= actions.length) {
+                if (belief.length === 0) return true;
+                if (round >= TOTAL_ROUNDS) return false;
+                // 犯人フェーズ: 手詰まりの経路は警察の勝ち（除去）、
+                // 残りは全合法手へ分岐したユニオンを次ラウンドの belief にする
+                const nextBelief = [];
+                for (const path of belief) {
+                    const endpoint = path[path.length - 1];
+                    const ex = endpoint % B_SIZE;
+                    const ey = (endpoint / B_SIZE) | 0;
+                    const visited = new Set(path);
+                    for (const [dx, dy] of dirs) {
+                        const nx = ex + dx;
+                        const ny = ey + dy;
+                        if (nx < 0 || ny < 0 || nx >= B_SIZE || ny >= B_SIZE) continue;
+                        const np = ny * B_SIZE + nx;
+                        if (visited.has(np)) continue;
+                        nextBelief.push(path.concat(np));
+                    }
+                }
+                if (nextBelief.length === 0) return true;
+                if (nextBelief.length > 2000) return false; // 組み合わせ爆発時は保守的に諦める
+                return solveRound(nextBelief, positions, round + 1, allIdxs) !== null;
+            }
+            const hi = acting[k];
+            const pos = positions[hi];
+            const action = actions[k];
+            if (action.type === 'wait') {
+                return applyActions(belief, positions, actions, k + 1, round, acting);
+            }
+            if (action.type === 'move') {
+                const t = action.target;
+                if (t.x < 0 || t.y < 0 || t.x >= I_SIZE || t.y >= I_SIZE) return false;
+                if (Math.abs(t.x - pos.x) + Math.abs(t.y - pos.y) !== 1) return false;
+                if (positions.some((p, pi) => pi !== hi && p.x === t.x && p.y === t.y)) return false;
+                const nextPositions = positions.slice();
+                nextPositions[hi] = { x: t.x, y: t.y };
+                return applyActions(belief, nextPositions, actions, k + 1, round, acting);
+            }
+            if (action.type === 'search') {
+                const t = action.target;
+                const adj = adjacentBuildings(pos.x, pos.y)
+                    .some(b => b.x === t.x && b.y === t.y);
+                if (!adj) return false;
+                const tci = t.y * B_SIZE + t.x;
+                // 捜索結果で belief を分岐する（発見した経路は勝ちとして除去）
+                const branches = new Map();
+                for (const path of belief) {
+                    const endpoint = path[path.length - 1];
+                    if (endpoint === tci) continue;
+                    const ii = path.indexOf(tci);
+                    let cls;
+                    if (ii < 0 || ii >= path.length - 1) cls = 'empty';
+                    else if (ii === 0) cls = 'Y';
+                    else if (ii === 5) cls = 'R';
+                    else cls = 'B';
+                    if (!branches.has(cls)) branches.set(cls, []);
+                    branches.get(cls).push(path);
+                }
+                for (const branch of branches.values()) {
+                    if (!applyActions(branch, positions, actions, k + 1, round, acting)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+
+        function solveRound(belief, positions, round, acting) {
+            if (++nodes > SOLVER_NODE_LIMIT) throw ABORT;
+            if (belief.length === 0) return [];
+            if (round > TOTAL_ROUNDS) return null;
+            const key = beliefKey(belief, positions, round, acting);
+            if (failMemo.has(key)) return null;
+            for (const plan of candidatePlans(belief, positions, acting, round)) {
+                if (applyActions(belief, positions, plan, 0, round, acting)) return plan;
+            }
+            failMemo.add(key);
+            return null;
+        }
+
+        try {
+            const plan = solveRound(paths, startPositions, S.currentRound, actingIdxs);
+            if (!plan) return null;
+            const map = new Map();
+            actingIdxs.forEach((hi, i) => {
+                if (plan[i]) map.set(hi, { ...plan[i], solver: true });
+            });
+            return map;
+        } catch (e) {
+            if (e === ABORT) return null;
+            throw e;
+        }
+    }
+
     function decidePoliceAction(heli) {
         if (!heli || heli.x == null || heli.hasActed) {
             return { type: 'wait', target: { x: heli ? heli.x : 0, y: heli ? heli.y : 0 } };
@@ -1561,6 +2174,12 @@
         const rawPost = getPosterior(S);
         const endgame = buildEndgameContext(rawPost, remaining.length);
 
+        // 0) タスク4: 終盤ソルバーで必勝プランがあれば最優先
+        const solverPlan = findForcedWinPlan(remaining);
+        if (solverPlan && solverPlan.has(heli.index)) {
+            return solverPlan.get(heli.index);
+        }
+
         // 1) このフェーズで候補全マスを覆えるなら必中プランを優先
         if (endgame.candidates.length > 0 && endgame.candidates.length <= remaining.length) {
             const coveragePlan = findCurrentPhaseCoveragePlan(remaining, endgame.candidates);
@@ -1569,10 +2188,8 @@
             }
         }
 
-        // 2) 候補が残り手数に収まるなら候補を意識した評価、
-        //    収まらないなら1手先読みで候補を絞る
-        let post = rawPost;
-        if (!endgame.canCoverAllEventually) post = applyThiefEscapePrior(rawPost);
+        // 2) タスク3の混合分布で共同プランを評価する
+        const post = getDecisionPosterior(S);
 
         const plan = planJointActions(
             remaining,
@@ -1823,9 +2440,15 @@
             inferredCandidates: () => inferredCandidates(S),
             decidePoliceAction,
             chooseMinimaxHeliSetup,
+            chooseRandomMinimaxHeliSetup,
             searchDistanceForBuilding,
             findCurrentPhaseCoveragePlan,
             buildEndgameContext,
+            enumerateConsistentPaths,
+            getPathAnalysis,
+            getDecisionPosterior: () => getDecisionPosterior(S),
+            assignmentCapture,
+            findForcedWinPlan,
         };
     }
 
@@ -1838,7 +2461,12 @@
             inferredCandidates,
             searchDistanceForBuilding,
             chooseMinimaxHeliSetup,
+            chooseRandomMinimaxHeliSetup,
             findCurrentPhaseCoveragePlan,
+            enumerateConsistentPaths,
+            analyzeConsistentPaths,
+            getPathAnalysis,
+            assignmentCapture,
         };
     }
 
