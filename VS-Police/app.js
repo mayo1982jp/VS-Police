@@ -15,6 +15,36 @@
         { id: 'yellow', label: '黄', color: '#ffc107' }
     ];
 
+    /* ---------- シード付き乱数（再現性のある検証用） ---------- */
+    // ?seed=123 で固定、?seed=random でページ読み込みごとにランダム。
+    // 未指定時は固定シード。startGame のたびに同じ初期値へ戻す。
+    const SEED_PARAM = (typeof location !== 'undefined' && location.search)
+        ? new URLSearchParams(location.search).get('seed')
+        : null;
+    function resolveInitialSeed() {
+        const raw = SEED_PARAM;
+        if (raw === 'random') return Date.now() >>> 0;
+        if (raw != null && raw !== '' && Number.isFinite(Number(raw))) return Number(raw) >>> 0;
+        return 0x1a2b3c4d;
+    }
+    const INITIAL_SEED = resolveInitialSeed();
+    let rngState = INITIAL_SEED >>> 0;
+
+    function seedRandom(seed) {
+        rngState = seed >>> 0;
+    }
+    // mulberry32
+    function rand() {
+        rngState = (rngState + 0x6D2B79F5) >>> 0;
+        let t = rngState;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    }
+    function randInt(n) {
+        return Math.floor(rand() * n);
+    }
+
     /* ---------- 状態 ---------- */
     let S = null;              // GameState (クロージャ内に閉じ込め DOM には露出しない)
 
@@ -43,10 +73,12 @@
             },
             buildings: Array.from({ length: B_SIZE }, (_, y) =>
                 Array.from({ length: B_SIZE }, (_, x) => ({
-                    x, y, isSearched: false, clue: null, clueRevealed: false
+                    x, y, isSearched: false, searchedRound: null,
+                    clue: null, clueRevealed: false
                 }))
             ),
             revealedClues: [],
+            searchLog: [],       // 警察が行った捜索 { round, x, y, result: 'empty' | 'clue' }
             logs: [],
             transitioning: false,
         };
@@ -184,6 +216,186 @@
         return 'BLUE';
     }
     const clueLabel = { YELLOW: '黄', RED: '赤', BLUE: '青' };
+
+    /* ==========================================================
+       事後分布推定（自己回避経路の列挙）
+       犯人は同じビルに二度入れないため、痕跡・空振り捜索と整合する
+       自己回避経路を全列挙し、現在位置（経路の終点）を数え上げる。
+       ========================================================== */
+    const POSTERIOR_CACHE = { key: null, result: null };
+
+    function posteriorSignature(state) {
+        const clues = (state.revealedClues || [])
+            .map(c => `${c.x},${c.y},${c.type}`)
+            .sort()
+            .join(';');
+        const empties = (state.searchLog || [])
+            .filter(s => s.result === 'empty')
+            .map(s => `${s.round},${s.x},${s.y}`)
+            .sort()
+            .join(';');
+        return `${state.currentRound}|${clues}|${empties}`;
+    }
+
+    /* 返り値: { counts, total, probs, cells }
+       counts[cell] = そのマスで終わる整合経路数
+       probs[cell]  = counts / total
+       cells        = 確率降順の { x, y, p } 配列 */
+    function thiefPosterior(state = S) {
+        const N = B_SIZE * B_SIZE;
+        const counts = new Float64Array(N);
+        const emptyResult = { counts, total: 0, probs: new Float64Array(N), cells: [] };
+        if (!state || !state.currentRound) return emptyResult;
+
+        const R = state.currentRound;
+        const maxIdx = R - 1;              // 警察フェーズ R のときの経路インデックス
+        if (maxIdx < 0) return emptyResult;
+
+        // --- 痕跡チップの制約 ---
+        // YELLOW = index 0, RED = index 5, BLUE = 1..4, 6..10。
+        // 警察フェーズ R で存在し得るのは index <= R-2 の痕跡だけ。
+        const clueAt = new Int16Array(N).fill(-1);
+        const clueAllowed = [];            // 各痕跡で許される経路インデックスのビットマスク
+        const clueMaxIdx = [];
+        const seenClueCells = new Set();
+        for (const c of state.revealedClues || []) {
+            if (c.x < 0 || c.x >= B_SIZE || c.y < 0 || c.y >= B_SIZE) continue;
+            const ci = c.y * B_SIZE + c.x;
+            if (seenClueCells.has(ci)) continue;
+            seenClueCells.add(ci);
+            let allowedIndices;
+            if (c.type === 'YELLOW') allowedIndices = [0];
+            else if (c.type === 'RED') allowedIndices = [5];
+            else allowedIndices = [1, 2, 3, 4, 6, 7, 8, 9, 10];
+            let mask = 0;
+            let maxAllowed = -1;
+            for (const i of allowedIndices) {
+                if (i <= maxIdx - 1) {
+                    mask |= (1 << i);
+                    if (i > maxAllowed) maxAllowed = i;
+                }
+            }
+            // この時点で存在し得ない痕跡（不整合）は無視して防御的に進む
+            if (mask === 0) continue;
+            const clueIndex = clueAllowed.length;
+            clueAllowed.push(mask);
+            clueMaxIdx.push(maxAllowed);
+            clueAt[ci] = clueIndex;
+        }
+
+        // --- 空振り捜索の制約 ---
+        // ラウンド r に空振りしたビルは、index <= r-1 のどの時点でも
+        // 犯人が滞在していなかった（滞在していれば痕跡が残っている）。
+        const forbiddenUntil = new Int8Array(N).fill(-1);
+        for (const s of state.searchLog || []) {
+            if (s.result !== 'empty') continue;
+            const i = s.round - 1;
+            if (i < 0 || i > maxIdx) continue;
+            const ci = s.y * B_SIZE + s.x;
+            if (i > forbiddenUntil[ci]) forbiddenUntil[ci] = i;
+        }
+
+        // 黄チップがあれば開始マスは確定
+        let forcedStart = -1;
+        for (let ci = 0; ci < N; ci++) {
+            if (clueAt[ci] >= 0 && (clueAllowed[clueAt[ci]] & 1)) {
+                forcedStart = ci;
+                break;
+            }
+        }
+
+        const allCluesMask = clueAllowed.length === 0 ? 0 : (1 << clueAllowed.length) - 1;
+        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+        let total = 0;
+
+        function dfs(idx, pos, visitedMask, satisfiedMask) {
+            // 満たせなくなる痕跡を枝刈り
+            for (let k = 0; k < clueAllowed.length; k++) {
+                if ((satisfiedMask & (1 << k)) === 0 && clueMaxIdx[k] < idx) return;
+            }
+            if (idx === maxIdx) {
+                if (satisfiedMask === allCluesMask) {
+                    counts[pos] += 1;
+                    total += 1;
+                }
+                return;
+            }
+            const x = pos % B_SIZE;
+            const y = (pos / B_SIZE) | 0;
+            const nextIdx = idx + 1;
+            for (const [dx, dy] of dirs) {
+                const nx = x + dx;
+                const ny = y + dy;
+                if (nx < 0 || ny < 0 || nx >= B_SIZE || ny >= B_SIZE) continue;
+                const np = ny * B_SIZE + nx;
+                if (visitedMask & (1 << np)) continue;
+                if (nextIdx <= forbiddenUntil[np]) continue;
+                let ns = satisfiedMask;
+                const clueIndex = clueAt[np];
+                if (clueIndex >= 0) {
+                    if ((clueAllowed[clueIndex] & (1 << nextIdx)) === 0) continue;
+                    ns |= (1 << clueIndex);
+                }
+                dfs(nextIdx, np, visitedMask | (1 << np), ns);
+            }
+        }
+
+        const startCandidates = [];
+        if (forcedStart >= 0) startCandidates.push(forcedStart);
+        else for (let ci = 0; ci < N; ci++) startCandidates.push(ci);
+        for (const sp of startCandidates) {
+            if (forbiddenUntil[sp] >= 0) continue;
+            let sm = 0;
+            const clueIndex = clueAt[sp];
+            if (clueIndex >= 0) {
+                if ((clueAllowed[clueIndex] & 1) === 0) continue;
+                sm |= (1 << clueIndex);
+            }
+            dfs(0, sp, 1 << sp, sm);
+        }
+
+        const probs = new Float64Array(N);
+        if (total > 0) {
+            for (let i = 0; i < N; i++) probs[i] = counts[i] / total;
+        } else {
+            // 観測が矛盾している場合の防御的フォールバック。
+            // 現在ラウンドに空振り済みのマスと痕跡マスだけを除外して一様分布にする。
+            let n = 0;
+            for (let ci = 0; ci < N; ci++) {
+                if (clueAt[ci] >= 0) continue;
+                if (maxIdx <= forbiddenUntil[ci]) continue;
+                probs[ci] = 1;
+                n++;
+            }
+            if (n === 0) {
+                probs.fill(1 / N);
+            } else {
+                for (let i = 0; i < N; i++) if (probs[i] > 0) probs[i] = 1 / n;
+            }
+        }
+
+        const cells = [];
+        for (let ci = 0; ci < N; ci++) {
+            if (probs[ci] > 0) {
+                cells.push({ x: ci % B_SIZE, y: (ci / B_SIZE) | 0, p: probs[ci] });
+            }
+        }
+        cells.sort((a, b) => b.p - a.p || a.y - b.y || a.x - b.x);
+        return { counts, total, probs, cells };
+    }
+
+    function getPosterior(state = S) {
+        const key = posteriorSignature(state);
+        if (POSTERIOR_CACHE.key === key) return POSTERIOR_CACHE.result;
+        const result = thiefPosterior(state);
+        POSTERIOR_CACHE.key = key;
+        POSTERIOR_CACHE.result = result;
+        return result;
+    }
+
+    function inferredCandidates(state = S) {
+        return getPosterior(state).cells.slice();
+    }
 
     /* ---------- ログ ---------- */
     const LOG_MAX = 200;
@@ -701,6 +913,7 @@
         heli.hasActed = true;
         const b = S.buildings[by][bx];
         b.isSearched = true;
+        b.searchedRound = S.currentRound;
         addLog(`${heli.label}ヘリが (${bx},${by}) を捜索…`, 'log-police');
         if (S.thief.carX === bx && S.thief.carY === by) {
             // 発見!
@@ -722,6 +935,12 @@
             addLog(`   → 何もない (確定)。`, 'log-info');
             showSearchResultBadge(bx, by); // 「いない」バッジは空振りのときのみ（痕跡発見時はチップを隠さない）
         }
+        // 警察CPUの事後分布推定用に捜索結果を記録
+        S.searchLog.push({
+            round: S.currentRound,
+            x: bx, y: by,
+            result: b.clue ? 'clue' : 'empty',
+        });
         autoSelectNextHeli();
         render();
         maybeEndPolicePhase();
@@ -955,18 +1174,22 @@
        CPU ロジック
        ========================================================== */
     function cpuSetupCar() {
-        // ヘリから最も遠いビルを選択
+        // ヘリの捜索圏に入るまでの移動数が最大のビルを選ぶ。
+        // 同点はマンハッタン距離→壁際の順で決定的に。
         const helis = S.police.helis.filter(h => h.x != null);
-        let best = null, bestScore = -1;
+        let best = null, bestScore = -Infinity;
         for (let by = 0; by < B_SIZE; by++) {
             for (let bx = 0; bx < B_SIZE; bx++) {
-                let minDist = Infinity;
+                let minSearch = Infinity, minMan = Infinity;
                 for (const h of helis) {
-                    // 交差点から隣接ビルへの最短距離 (ビル中心とのマンハッタン近似)
-                    const d = Math.abs(bx - h.x) + Math.abs(by - h.y);
-                    if (d < minDist) minDist = d;
+                    const ds = searchDistanceForBuilding(bx, by, h.x, h.y);
+                    if (ds < minSearch) minSearch = ds;
+                    const dm = Math.abs(bx - h.x) + Math.abs(by - h.y);
+                    if (dm < minMan) minMan = dm;
                 }
-                if (minDist > bestScore) { bestScore = minDist; best = { x: bx, y: by }; }
+                const edge = (bx === 0 || bx === B_SIZE - 1 || by === 0 || by === B_SIZE - 1) ? 1 : 0;
+                const score = minSearch * 10 + minMan * 0.5 + edge * 0.2;
+                if (score > bestScore) { bestScore = score; best = { x: bx, y: by }; }
             }
         }
         if (!best) best = { x: 0, y: 0 };
@@ -1000,9 +1223,9 @@
             const score = minDist + edgeBonus * 0.5;
             if (score > bestScore) { bestScore = score; best = m; }
         }
-        // 少しランダム性
-        if (Math.random() < 0.15 && moves.length > 1) {
-            best = moves[Math.floor(Math.random() * moves.length)];
+        // 少しランダム性（シード付き乱数で再現可能）
+        if (rand() < 0.15 && moves.length > 1) {
+            best = moves[randInt(moves.length)];
         }
         addLog(`🤖 CPU が思考中…`, 'log-info');
         setTimeout(() => {
@@ -1012,24 +1235,351 @@
     }
 
     /* ---------- 警察CPU (犯人ソロプレイ用) ---------- */
-    function cpuSetupHeli() {
-        // 4x4交差点から重複なしでランダムに3箇所を選択
-        const all = [];
-        for (let iy = 0; iy < I_SIZE; iy++)
-            for (let ix = 0; ix < I_SIZE; ix++)
-                all.push({ x: ix, y: iy });
-        // Fisher-Yatesで3つ取り出し
-        for (let i = all.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [all[i], all[j]] = [all[j], all[i]];
+
+    /* ビル (bx,by) を捜索できる交差点までの最小移動数。
+       ヘリの初期配置・犯人CPUの潜伏位置評価に使う。 */
+    function searchDistanceForBuilding(bx, by, ix, iy) {
+        let best = Infinity;
+        const corners = [
+            { x: bx,     y: by     },
+            { x: bx - 1, y: by     },
+            { x: bx,     y: by - 1 },
+            { x: bx - 1, y: by - 1 },
+        ];
+        for (const c of corners) {
+            if (c.x < 0 || c.y < 0 || c.x >= I_SIZE || c.y >= I_SIZE) continue;
+            const d = Math.abs(c.x - ix) + Math.abs(c.y - iy);
+            if (d < best) best = d;
         }
-        const positions = all.slice(0, 3);
+        return best;
+    }
+
+    function compareMinimaxSetup(a, b) {
+        if (a.maxSearch !== b.maxSearch) return a.maxSearch - b.maxSearch;
+        if (a.sumSearch !== b.sumSearch) return a.sumSearch - b.sumSearch;
+        if (a.immediate !== b.immediate) return b.immediate - a.immediate;
+        if (a.maxManhattan !== b.maxManhattan) return a.maxManhattan - b.maxManhattan;
+        if (a.sumManhattan !== b.sumManhattan) return a.sumManhattan - b.sumManhattan;
+        for (let i = 0; i < a.combo.length; i++) {
+            if (a.combo[i].y !== b.combo[i].y) return a.combo[i].y - b.combo[i].y;
+            if (a.combo[i].x !== b.combo[i].x) return a.combo[i].x - b.combo[i].x;
+        }
+        return 0;
+    }
+
+    /* C(16,3)=560 通りを全探索し、全ビルへの最大捜索距離を最小化する。
+       副次評価として合計距離・即時捜索可能数・マンハッタン距離も見る。 */
+    function chooseMinimaxHeliSetup() {
+        const intersections = [];
+        for (let y = 0; y < I_SIZE; y++)
+            for (let x = 0; x < I_SIZE; x++)
+                intersections.push({ x, y });
+        let best = null;
+        for (let a = 0; a < intersections.length; a++) {
+            for (let b = a + 1; b < intersections.length; b++) {
+                for (let c = b + 1; c < intersections.length; c++) {
+                    const combo = [intersections[a], intersections[b], intersections[c]];
+                    let maxSearch = 0, sumSearch = 0, immediate = 0;
+                    let maxManhattan = 0, sumManhattan = 0;
+                    for (let by = 0; by < B_SIZE; by++) {
+                        for (let bx = 0; bx < B_SIZE; bx++) {
+                            let dSearch = Infinity, dMan = Infinity;
+                            for (const p of combo) {
+                                const ds = searchDistanceForBuilding(bx, by, p.x, p.y);
+                                if (ds < dSearch) dSearch = ds;
+                                const dm = Math.abs(bx - p.x) + Math.abs(by - p.y);
+                                if (dm < dMan) dMan = dm;
+                            }
+                            maxSearch = Math.max(maxSearch, dSearch);
+                            sumSearch += dSearch;
+                            if (dSearch === 0) immediate++;
+                            maxManhattan = Math.max(maxManhattan, dMan);
+                            sumManhattan += dMan;
+                        }
+                    }
+                    const candidate = {
+                        combo, maxSearch, sumSearch, immediate, maxManhattan, sumManhattan
+                    };
+                    if (!best || compareMinimaxSetup(candidate, best) < 0) best = candidate;
+                }
+            }
+        }
+        return best;
+    }
+
+    function cpuSetupHeli() {
+        const setup = chooseMinimaxHeliSetup();
+        const positions = setup.combo;
         S.police.helis.forEach((h, i) => {
             h.x = positions[i].x;
             h.y = positions[i].y;
             addLog(`🤖 ${h.label}ヘリを (${h.x},${h.y}) に配置。`, 'log-police');
         });
+        addLog(`🤖 警察CPU: minimax配置（全ビルへの最大捜索距離 ${setup.maxSearch}）`, 'log-info');
         render();
+    }
+
+    /* ---------- 事後分布を使った警察CPUの意思決定 ---------- */
+    const SEARCH_INFO_BONUS = 0.06;      // 未捜索ビルを開ける情報価値
+    const MOVE_DISCOUNT = 0.8;           // 移動して次ラウンドに捜索する価値の割引
+    const MOVE_INFO_WEIGHT = 0.02;       // 移動先の未捜索ビル1つあたりの情報価値
+    const MOVE_DIST_PENALTY = 0.01;      // 候補から遠い移動へのペナルティ
+    const MOVE_APPROACH_BONUS = 0.10;    // 候補に1手近づく価値
+    const ENDGAME_SEARCH_BONUS = 0.35;   // 終盤で候補マスを捜索する価値
+    const ENDGAME_MOVE_BONUS = 0.08;     // 終盤で候補マスに近づく移動の価値
+
+    function postProb(post, x, y) {
+        return post.probs[y * B_SIZE + x] || 0;
+    }
+
+    function isSearchedThisRound(x, y) {
+        return S.buildings[y][x].searchedRound === S.currentRound;
+    }
+
+    /* 終盤判定: 残り警察フェーズ数×3手で候補を覆えるかを見積もる。 */
+    function buildEndgameContext(post, activeHelis = S.police.helis.length) {
+        const candidates = post.cells.filter(c => c.p > 0);
+        const candidateKeys = new Set(candidates.map(c => c.y * B_SIZE + c.x));
+        const remainingPhases = TOTAL_ROUNDS - S.currentRound + 1;
+        const totalSearchActions = remainingPhases * activeHelis;
+        const endgameActive = candidates.length > 0
+            && candidates.length <= totalSearchActions
+            && (remainingPhases <= 3 || candidates.length <= 3);
+        return {
+            candidates,
+            candidateKeys,
+            remainingPhases,
+            totalSearchActions,
+            canCoverAllEventually: candidates.length > 0 && candidates.length <= totalSearchActions,
+            endgameActive,
+        };
+    }
+
+    /* この警察フェーズの残り手数で候補全マスを捜索できるなら、
+       候補とヘリの完全マッチングを返す（必中プラン）。 */
+    function findCurrentPhaseCoveragePlan(helis, candidates) {
+        if (candidates.length === 0 || candidates.length > helis.length) return null;
+        const searchable = helis.map(h => {
+            const set = new Set();
+            for (const b of searchableBuildings(h)) {
+                if (b.x < 0 || b.y < 0 || b.x >= B_SIZE || b.y >= B_SIZE) continue;
+                set.add(b.y * B_SIZE + b.x);
+            }
+            return set;
+        });
+        // 捜索可能なヘリが少ない候補から割り当てる
+        const sortedCandidates = candidates.slice().sort((a, b) => {
+            const ca = a.y * B_SIZE + a.x;
+            const cb = b.y * B_SIZE + b.x;
+            let na = 0, nb = 0;
+            for (const s of searchable) { if (s.has(ca)) na++; if (s.has(cb)) nb++; }
+            return na - nb || b.p - a.p || a.y - b.y || a.x - b.x;
+        });
+        const assignment = new Array(helis.length).fill(null);
+        const used = new Uint8Array(helis.length);
+        function assignCandidate(k) {
+            if (k >= sortedCandidates.length) return true;
+            const c = sortedCandidates[k];
+            const ck = c.y * B_SIZE + c.x;
+            for (let i = 0; i < helis.length; i++) {
+                if (used[i] || !searchable[i].has(ck)) continue;
+                used[i] = 1;
+                assignment[i] = c;
+                if (assignCandidate(k + 1)) return true;
+                used[i] = 0;
+                assignment[i] = null;
+            }
+            return false;
+        }
+        if (!assignCandidate(0)) return null;
+        const plan = new Map();
+        helis.forEach((h, i) => {
+            if (assignment[i]) {
+                plan.set(h.index, {
+                    type: 'search',
+                    target: { x: assignment[i].x, y: assignment[i].y },
+                    coverage: true,
+                });
+            }
+        });
+        return plan;
+    }
+
+    /* 候補が多すぎて覆えない場合の1手先読み。
+       犯人CPUの「ヘリから遠い・壁際を好む」方針で候補を再重み付けする。 */
+    function applyThiefEscapePrior(post) {
+        const candidates = post.cells.filter(c => c.p > 0);
+        if (candidates.length <= 1) return post;
+        const helis = S.police.helis.filter(h => h.x != null);
+        if (helis.length === 0) return post;
+        const probs = new Float64Array(B_SIZE * B_SIZE);
+        let total = 0;
+        for (const c of candidates) {
+            let minDist = Infinity;
+            for (const h of helis) {
+                const d = Math.abs(c.x - h.x) + Math.abs(c.y - h.y);
+                if (d < minDist) minDist = d;
+            }
+            const edge = (c.x === 0 || c.x === B_SIZE - 1 || c.y === 0 || c.y === B_SIZE - 1) ? 1 : 0;
+            const weight = c.p * (1 + 0.06 * (minDist + edge * 0.5));
+            probs[c.y * B_SIZE + c.x] = weight;
+            total += weight;
+        }
+        if (total <= 0) return post;
+        const cells = [];
+        for (let ci = 0; ci < probs.length; ci++) {
+            if (probs[ci] > 0) {
+                probs[ci] /= total;
+                cells.push({ x: ci % B_SIZE, y: (ci / B_SIZE) | 0, p: probs[ci] });
+            }
+        }
+        cells.sort((a, b) => b.p - a.p || a.y - b.y || a.x - b.x);
+        return { ...post, probs, cells, priorAdjusted: true };
+    }
+
+    /* 1機ぶんの候補手（捜索・移動）とその価値を列挙する。 */
+    function generateHeliActions(heli, post, endgame) {
+        const actions = [];
+        for (const b of searchableBuildings(heli)) {
+            if (b.x < 0 || b.y < 0 || b.x >= B_SIZE || b.y >= B_SIZE) continue;
+            const building = S.buildings[b.y][b.x];
+            if (building.clueRevealed) continue;          // 痕跡マスは現在位置になり得ない
+            if (isSearchedThisRound(b.x, b.y)) continue;  // 同ラウンドの再捜索は無意味
+            const ck = b.y * B_SIZE + b.x;
+            let value = postProb(post, b.x, b.y);
+            if (!building.isSearched) value += SEARCH_INFO_BONUS;
+            if (endgame && endgame.candidateKeys.has(ck)) value += ENDGAME_SEARCH_BONUS;
+            actions.push({ type: 'search', target: { x: b.x, y: b.y }, cellKey: ck, value });
+        }
+
+        const currentAdj = adjacentBuildings(heli.x, heli.y)
+            .filter(b => b.x >= 0 && b.y >= 0 && b.x < B_SIZE && b.y < B_SIZE);
+        let currentCoverage = 0, currentUnsearched = 0;
+        for (const b of currentAdj) {
+            currentCoverage += postProb(post, b.x, b.y);
+            if (!S.buildings[b.y][b.x].isSearched) currentUnsearched++;
+        }
+        let currentNearest = Infinity;
+        for (const c of post.cells) {
+            if (c.p <= 0) continue;
+            const d = searchDistanceForBuilding(c.x, c.y, heli.x, heli.y);
+            if (d < currentNearest) currentNearest = d;
+        }
+        if (!isFinite(currentNearest)) currentNearest = 0;
+
+        for (const m of validHeliMoves(heli)) {
+            const adj = adjacentBuildings(m.x, m.y)
+                .filter(b => b.x >= 0 && b.y >= 0 && b.x < B_SIZE && b.y < B_SIZE);
+            let coverage = 0, unsearched = 0;
+            for (const b of adj) {
+                coverage += postProb(post, b.x, b.y);
+                if (!S.buildings[b.y][b.x].isSearched) unsearched++;
+            }
+            let nearest = Infinity;
+            for (const c of post.cells) {
+                if (c.p <= 0) continue;
+                const d = searchDistanceForBuilding(c.x, c.y, m.x, m.y);
+                if (d < nearest) nearest = d;
+            }
+            if (!isFinite(nearest)) nearest = 0;
+            let value = MOVE_DISCOUNT * (coverage - currentCoverage)
+                + MOVE_INFO_WEIGHT * (unsearched - currentUnsearched)
+                - MOVE_DIST_PENALTY * nearest
+                + MOVE_APPROACH_BONUS * Math.max(0, currentNearest - nearest);
+            if (endgame && endgame.candidateKeys.size > 0) {
+                for (const b of adj) {
+                    if (endgame.candidateKeys.has(b.y * B_SIZE + b.x)) {
+                        value += ENDGAME_MOVE_BONUS;
+                        break;
+                    }
+                }
+            }
+            actions.push({ type: 'move', target: { x: m.x, y: m.y }, value });
+        }
+
+        if (actions.length === 0) {
+            actions.push({ type: 'wait', target: { x: heli.x, y: heli.y }, value: 0 });
+        }
+        return actions;
+    }
+
+    /* 残り全機の行動の組合せを評価し、3機でカバーできる確率質量が
+       最大になる割当を選ぶ。 */
+    function planJointActions(helis, post, endgame) {
+        if (helis.length === 0) return { actions: [], score: 0 };
+        const actionLists = helis.map(h => generateHeliActions(h, post, endgame));
+        let bestCombo = null;
+        let bestScore = -Infinity;
+        const chosen = new Array(helis.length);
+
+        function evaluate(idx, searchedKeys, moveTargets, score) {
+            if (idx === helis.length) {
+                if (score > bestScore + 1e-9) {
+                    bestScore = score;
+                    bestCombo = chosen.slice();
+                }
+                return;
+            }
+            for (const action of actionLists[idx]) {
+                let add = 0;
+                let nextSearched = searchedKeys;
+                let nextMoves = moveTargets;
+                if (action.type === 'search') {
+                    if (searchedKeys.has(action.cellKey)) {
+                        add = -0.02; // 同じマスの重複捜索は避ける
+                    } else {
+                        add = action.value;
+                        nextSearched = new Set(searchedKeys);
+                        nextSearched.add(action.cellKey);
+                    }
+                } else if (action.type === 'move') {
+                    const mk = action.target.y * I_SIZE + action.target.x;
+                    if (moveTargets.has(mk)) continue; // 同時に同じ交差点へは移動不可
+                    add = action.value;
+                    nextMoves = new Set(moveTargets);
+                    nextMoves.add(mk);
+                } else {
+                    add = action.value;
+                }
+                chosen[idx] = action;
+                evaluate(idx + 1, nextSearched, nextMoves, score + add);
+            }
+        }
+
+        evaluate(0, new Set(), new Set(), 0);
+        return { actions: bestCombo || [], score: bestScore };
+    }
+
+    function decidePoliceAction(heli) {
+        if (!heli || heli.x == null || heli.hasActed) {
+            return { type: 'wait', target: { x: heli ? heli.x : 0, y: heli ? heli.y : 0 } };
+        }
+        // 現在のヘリを先頭にした残り機リスト
+        const remaining = [heli].concat(
+            S.police.helis.filter(h => h !== heli && !h.hasActed && h.x != null)
+        );
+        const rawPost = getPosterior(S);
+        const endgame = buildEndgameContext(rawPost, remaining.length);
+
+        // 1) このフェーズで候補全マスを覆えるなら必中プランを優先
+        if (endgame.candidates.length > 0 && endgame.candidates.length <= remaining.length) {
+            const coveragePlan = findCurrentPhaseCoveragePlan(remaining, endgame.candidates);
+            if (coveragePlan && coveragePlan.has(heli.index)) {
+                return coveragePlan.get(heli.index);
+            }
+        }
+
+        // 2) 候補が残り手数に収まるなら候補を意識した評価、
+        //    収まらないなら1手先読みで候補を絞る
+        let post = rawPost;
+        if (!endgame.canCoverAllEventually) post = applyThiefEscapePrior(rawPost);
+
+        const plan = planJointActions(
+            remaining,
+            post,
+            endgame.endgameActive ? endgame : null
+        );
+        return plan.actions[0] || { type: 'wait', target: { x: heli.x, y: heli.y } };
     }
 
     function cpuPoliceTurn() {
@@ -1044,77 +1594,27 @@
                 maybeEndPolicePhase();
                 return;
             }
-            const heli = S.police.helis[heliIdx];
-            heliIdx++;
+            const heli = S.police.helis[heliIdx++];
             S.police.selected = heli.index;
             render();
 
-            const targets = searchableBuildings(heli);
-            const moves = validHeliMoves(heli);
-            const unsearched = targets.filter(t => !S.buildings[t.y][t.x].isSearched);
-
-            if (unsearched.length > 0) {
-                // 未捜索の隣接ビルがあるなら捜索
-                const best = pickBestSearchTarget(unsearched);
-                setTimeout(() => {
-                    doSearch(heli, best.x, best.y);
-                    if (S.winner == null) setTimeout(nextHeli, 700);
-                    else S.transitioning = false;
-                }, 500);
-            } else if (moves.length > 0) {
-                // 周囲が捜索済みなら、未捜索ビルが多い交差点へ移動
-                const best = pickBestMoveTarget(moves);
-                setTimeout(() => {
-                    doMoveHeli(heli, best.x, best.y);
-                    if (S.winner == null) setTimeout(nextHeli, 700);
-                    else S.transitioning = false;
-                }, 500);
-            } else if (targets.length > 0) {
-                // 身動き不可: 再捜索でカバー
-                const best = pickBestSearchTarget(targets);
-                setTimeout(() => {
-                    doSearch(heli, best.x, best.y);
-                    if (S.winner == null) setTimeout(nextHeli, 700);
-                    else S.transitioning = false;
-                }, 500);
-            } else {
-                // 行動不可: スキップ
-                heli.hasActed = true;
-                setTimeout(nextHeli, 300);
-            }
+            const action = decidePoliceAction(heli);
+            setTimeout(() => {
+                if (S.winner != null) { S.transitioning = false; return; }
+                if (action.type === 'search') {
+                    doSearch(heli, action.target.x, action.target.y);
+                } else if (action.type === 'move') {
+                    doMoveHeli(heli, action.target.x, action.target.y);
+                } else {
+                    heli.hasActed = true;
+                    addLog(`${heli.label}ヘリは行動できませんでした。`, 'log-alert');
+                    render();
+                }
+                if (S.winner == null) setTimeout(nextHeli, 700);
+                else S.transitioning = false;
+            }, 500);
         }
         nextHeli();
-    }
-
-    function pickBestSearchTarget(targets) {
-        // 優先順位: 痕跡附近有り > 盤面中央付近 > ランダム
-        let best = targets[0], bestScore = -Infinity;
-        for (const t of targets) {
-            let score = 0;
-            // 痕跡の近くだと高評価
-            for (const c of S.revealedClues) {
-                const d = Math.abs(t.x - c.x) + Math.abs(t.y - c.y);
-                if (d <= 2) score += (3 - d) * 2;
-            }
-            // 盤面中央付近を好む
-            score += (2 - Math.abs(t.x - 2)) + (2 - Math.abs(t.y - 2));
-            // 少ランダム
-            score += Math.random() * 1.5;
-            if (score > bestScore) { bestScore = score; best = t; }
-        }
-        return best;
-    }
-
-    function pickBestMoveTarget(moves) {
-        // 未捜索ビルが周囲に多い交差点へ
-        let best = moves[0], bestScore = -Infinity;
-        for (const m of moves) {
-            const adj = adjacentBuildings(m.x, m.y).filter(b => b.x < B_SIZE && b.y < B_SIZE);
-            const unsearched = adj.filter(b => !S.buildings[b.y][b.x].isSearched).length;
-            let score = unsearched * 2 + Math.random();
-            if (score > bestScore) { bestScore = score; best = m; }
-        }
-        return best;
     }
 
     /* ==========================================================
@@ -1201,6 +1701,7 @@
        初期化・イベント紐付け
        ========================================================== */
     function startGame(mode) {
+        seedRandom(INITIAL_SEED);
         S = createState(mode);
         document.body.classList.remove('thief-view');
         splashScreen.classList.add('hidden');
@@ -1208,6 +1709,9 @@
         routeModal.classList.add('hidden');
         logAreaEl.innerHTML = '';
         buildBoardDOM();
+        if (SEED_PARAM != null) {
+            addLog(`乱数シード: ${INITIAL_SEED}`, 'log-info');
+        }
         if (mode === 'cpu_police') {
             addLog('🚗 犯人ソロプレイを開始。あなたは逃走車の運転手です。', 'log-info');
             addLog('警察CPU: ヘリ3機を自動配置します…', 'log-police');
@@ -1302,9 +1806,40 @@
         // 盤面は startGame で生成
     }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
-    } else {
-        init();
+    // 検証用デバッグフック（?debug=1 のときだけ公開）
+    if (typeof window !== 'undefined' && typeof location !== 'undefined'
+        && new URLSearchParams(location.search).get('debug') === '1') {
+        window.__VS_POLICE_DEBUG__ = {
+            getState: () => S,
+            getPosterior: () => getPosterior(S),
+            thiefPosterior,
+            inferredCandidates: () => inferredCandidates(S),
+            decidePoliceAction,
+            chooseMinimaxHeliSetup,
+            searchDistanceForBuilding,
+            findCurrentPhaseCoveragePlan,
+            buildEndgameContext,
+        };
+    }
+
+    // Node からのユニットテスト用エクスポート（ブラウザでは無効）
+    if (typeof module !== 'undefined' && module.exports) {
+        module.exports = {
+            createState,
+            thiefPosterior,
+            getPosterior,
+            inferredCandidates,
+            searchDistanceForBuilding,
+            chooseMinimaxHeliSetup,
+            findCurrentPhaseCoveragePlan,
+        };
+    }
+
+    if (typeof document !== 'undefined') {
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', init);
+        } else {
+            init();
+        }
     }
 })();
