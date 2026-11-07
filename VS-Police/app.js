@@ -1613,6 +1613,11 @@
     // タスク4: 終盤ソルバーの発動上限（経路数が多い序盤では読み切れないため）
     const SOLVER_MAX_PATHS = 500;
     const SOLVER_NODE_LIMIT = 30000;     // 探索ノード数の上限（超えたら諦めて通常評価へ）
+    const MINIMAX_NODE_LIMIT = 25000;    // 勝率ミニマックス探索のノード上限
+    // 中盤2手先読み: 経路数がこれを超える局面では読まない（終盤はソルバー側が担当）
+    const LOOKAHEAD_MAX_PATHS = 12000;
+    const LOOKAHEAD_MARGIN = 0.03;       // 先読みが通常プランを覆すのに必要な差
+    const WIN_VALUE = 1;                 // 先読み評価での「発見・手詰まり」の価値（勝率スケールに正規化）
 
     function postProb(post, x, y) {
         return post.probs[y * B_SIZE + x] || 0;
@@ -2082,6 +2087,40 @@
         return plan;
     }
 
+    /* ソルバー共通: belief の識別キー（メモ化用）。 */
+    function solverBeliefKey(belief, positions, round, acting) {
+        return belief.map(p => p.join(',')).sort().join('|')
+            + '#' + positions.map(p => `${p.x},${p.y}`).join(';')
+            + '#' + round + '#' + acting.join(',');
+    }
+
+    /* ソルバー共通: 候補プラン生成（現在分布への貪欲プラン、伝播分布への
+       貪欲プラン、現在ラウンドのみ実状態の共同プラン）。 */
+    function solverCandidatePlans(belief, positions, acting, round) {
+        const plans = [];
+        const seen = new Set();
+        const addPlan = (plan) => {
+            const k = JSON.stringify(plan.map(a => `${a.type}:${a.target.x},${a.target.y}`));
+            if (!seen.has(k)) { seen.add(k); plans.push(plan); }
+        };
+        const post = solverBeliefPost(belief);
+        addPlan(solverGreedyPlan(belief, positions, acting, post));
+        const prop = analyzeConsistentPaths(belief).propagated;
+        addPlan(solverGreedyPlan(belief, positions, acting, prop));
+        if (round === S.currentRound) {
+            const fakeHelis = acting.map(hi => ({
+                index: hi, x: positions[hi].x, y: positions[hi].y, hasActed: false,
+            }));
+            const joint = planJointActions(fakeHelis, getDecisionPosterior(S), null);
+            if (joint.actions && joint.actions.length === acting.length) {
+                addPlan(joint.actions.map(a => ({
+                    type: a.type, target: { x: a.target.x, y: a.target.y },
+                })));
+            }
+        }
+        return plans;
+    }
+
     function findForcedWinPlan(remainingHelis) {
         const { paths } = getPathAnalysis(S);
         if (!paths || paths.length === 0) return null;
@@ -2100,38 +2139,6 @@
         let nodes = 0;
         const failMemo = new Set();
         const ABORT = { solverAbort: true };
-
-        function beliefKey(belief, positions, round, acting) {
-            return belief.map(p => p.join(',')).sort().join('|')
-                + '#' + positions.map(p => `${p.x},${p.y}`).join(';')
-                + '#' + round + '#' + acting.join(',');
-        }
-
-        function candidatePlans(belief, positions, acting, round) {
-            const plans = [];
-            const seen = new Set();
-            const addPlan = (plan) => {
-                const k = JSON.stringify(plan.map(a => `${a.type}:${a.target.x},${a.target.y}`));
-                if (!seen.has(k)) { seen.add(k); plans.push(plan); }
-            };
-            const post = solverBeliefPost(belief);
-            addPlan(solverGreedyPlan(belief, positions, acting, post));
-            const prop = analyzeConsistentPaths(belief).propagated;
-            addPlan(solverGreedyPlan(belief, positions, acting, prop));
-            // 現在ラウンドだけは実状態と一致する共同プランも候補に入れる
-            if (round === S.currentRound) {
-                const fakeHelis = acting.map(hi => ({
-                    index: hi, x: positions[hi].x, y: positions[hi].y, hasActed: false,
-                }));
-                const joint = planJointActions(fakeHelis, getDecisionPosterior(S), null);
-                if (joint.actions && joint.actions.length === acting.length) {
-                    addPlan(joint.actions.map(a => ({
-                        type: a.type, target: { x: a.target.x, y: a.target.y },
-                    })));
-                }
-            }
-            return plans;
-        }
 
         function applyActions(belief, positions, actions, k, round, acting) {
             if (++nodes > SOLVER_NODE_LIMIT) throw ABORT;
@@ -2208,9 +2215,9 @@
             if (++nodes > SOLVER_NODE_LIMIT) throw ABORT;
             if (belief.length === 0) return [];
             if (round > TOTAL_ROUNDS) return null;
-            const key = beliefKey(belief, positions, round, acting);
+            const key = solverBeliefKey(belief, positions, round, acting);
             if (failMemo.has(key)) return null;
-            for (const plan of candidatePlans(belief, positions, acting, round)) {
+            for (const plan of solverCandidatePlans(belief, positions, acting, round)) {
                 if (applyActions(belief, positions, plan, 0, round, acting)) return plan;
             }
             failMemo.add(key);
@@ -2231,6 +2238,314 @@
         }
     }
 
+    /* ---------- 終盤ソルバーの勝率ミニマックス化 ----------
+       必勝ソルバー（AND-OR）で勝ち切れない局面でも、「警察の勝率」を最大化する
+       手を選べるよう、belief に対する期待値探索を行う。
+       - 警察ノード: 候補プランのうち勝率最大を選ぶ（max）
+       - 捜索: 結果分岐（発見/黄/赤/青/空）の確率加重平均（chance）。
+         枝の途中でも「残りの確率質量を全部足しても現在の最良値を超えない」
+         場合は打ち切る（アルファベータ式の境界剪定）
+       - 犯人ノード: 経路ごとに「次ラウンドに最も捜索されにくい移動」だけを
+         残す近似の min（adversarial）。手詰まりの経路は警察の勝ちとして数える
+       - 局面はメモ化して再利用する（transposition table） */
+    function minimaxEndgameSolve(remainingHelis) {
+        const { paths } = getPathAnalysis(S);
+        if (!paths || paths.length === 0) return null;
+        const rawPost = getPosterior(S);
+        const remainingPhases = TOTAL_ROUNDS - S.currentRound + 1;
+        const candidateCount = rawPost.cells.length;
+        const triggered = paths.length <= SOLVER_MAX_PATHS
+            && (remainingPhases <= 4 || candidateCount <= 6);
+        if (!triggered) return null;
+
+        const allIdxs = S.police.helis.map(h => h.index);
+        const actingIdxs = remainingHelis.map(h => h.index);
+        const startPositions = S.police.helis.map(h => ({ x: h.x, y: h.y }));
+        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+        let nodes = 0;
+        const memo = new Map();
+        const ABORT = { minimaxAbort: true };
+
+        // 犯人の adversarial 移動: その経路にとって最も安全な移動先だけ残す
+        function thiefExtend(belief, positions) {
+            let trapped = 0;
+            const nextBelief = [];
+            for (const path of belief) {
+                const endpoint = path[path.length - 1];
+                const ex = endpoint % B_SIZE;
+                const ey = (endpoint / B_SIZE) | 0;
+                const visited = new Set(path);
+                const moves = [];
+                for (const [dx, dy] of dirs) {
+                    const nx = ex + dx;
+                    const ny = ey + dy;
+                    if (nx < 0 || ny < 0 || nx >= B_SIZE || ny >= B_SIZE) continue;
+                    const np = ny * B_SIZE + nx;
+                    if (!visited.has(np)) moves.push(np);
+                }
+                if (moves.length === 0) { trapped += 1; continue; }
+                // 安全さ = 最も近いヘリからの捜索距離が大きいほど安全
+                let bestSafety = -Infinity;
+                const safety = moves.map(m => {
+                    const mx = m % B_SIZE;
+                    const my = (m / B_SIZE) | 0;
+                    let d = Infinity;
+                    for (const p of positions) {
+                        d = Math.min(d, searchDistanceForBuilding(mx, my, p.x, p.y));
+                    }
+                    if (d > bestSafety) bestSafety = d;
+                    return d;
+                });
+                moves.forEach((m, i) => {
+                    if (safety[i] === bestSafety) nextBelief.push(path.concat(m));
+                });
+            }
+            return { nextBelief, trapFraction: belief.length > 0 ? trapped / belief.length : 0 };
+        }
+
+        function valueActions(belief, positions, actions, k, round, acting, alpha) {
+            if (++nodes > MINIMAX_NODE_LIMIT) throw ABORT;
+            if (belief.length === 0) return 1;
+            if (k >= actions.length) {
+                if (round >= TOTAL_ROUNDS) return 0;
+                const { nextBelief, trapFraction } = thiefExtend(belief, positions);
+                if (nextBelief.length === 0) return 1;
+                if (nextBelief.length > 2000) {
+                    // 爆発時は伝播分布への割当捕捉率で近似評価する
+                    const post = solverBeliefPost(nextBelief.slice(0, 2000));
+                    return trapFraction + (1 - trapFraction) * assignmentCapture(positions, post);
+                }
+                const sub = valueRound(nextBelief, positions, round + 1, allIdxs);
+                return trapFraction + (1 - trapFraction) * sub;
+            }
+            const hi = acting[k];
+            const pos = positions[hi];
+            const action = actions[k];
+            if (action.type === 'wait') {
+                return valueActions(belief, positions, actions, k + 1, round, acting, alpha);
+            }
+            if (action.type === 'move') {
+                const t = action.target;
+                if (t.x < 0 || t.y < 0 || t.x >= I_SIZE || t.y >= I_SIZE) return 0;
+                if (Math.abs(t.x - pos.x) + Math.abs(t.y - pos.y) !== 1) return 0;
+                if (positions.some((p, pi) => pi !== hi && p.x === t.x && p.y === t.y)) return 0;
+                const nextPositions = positions.slice();
+                nextPositions[hi] = { x: t.x, y: t.y };
+                return valueActions(belief, nextPositions, actions, k + 1, round, acting, alpha);
+            }
+            if (action.type === 'search') {
+                const t = action.target;
+                const adj = adjacentBuildings(pos.x, pos.y)
+                    .some(b => b.x === t.x && b.y === t.y);
+                if (!adj) return 0;
+                const tci = t.y * B_SIZE + t.x;
+                const total = belief.length;
+                let hitCount = 0;
+                const branches = new Map();
+                for (const path of belief) {
+                    const endpoint = path[path.length - 1];
+                    if (endpoint === tci) { hitCount += 1; continue; }
+                    const ii = path.indexOf(tci);
+                    let cls;
+                    if (ii < 0 || ii >= path.length - 1) cls = 'empty';
+                    else if (ii === 0) cls = 'Y';
+                    else if (ii === 5) cls = 'R';
+                    else cls = 'B';
+                    if (!branches.has(cls)) branches.set(cls, []);
+                    branches.get(cls).push(path);
+                }
+                // 大きい枝から評価し、境界剪定を効かせる
+                const branchList = [...branches.values()].sort((a, b) => b.length - a.length);
+                let acc = hitCount / total; // 発見した分は勝ち
+                let remainingMass = 1 - acc;
+                for (const branch of branchList) {
+                    const w = branch.length / total;
+                    const v = valueActions(branch, positions, actions, k + 1, round, acting, alpha);
+                    acc += w * v;
+                    remainingMass -= w;
+                    // 残りを全て勝っても alpha（現在の最良値）に届かないなら打ち切り
+                    if (acc + remainingMass <= alpha) return acc + remainingMass;
+                }
+                return acc;
+            }
+            return 0;
+        }
+
+        function valueRound(belief, positions, round, acting) {
+            if (++nodes > MINIMAX_NODE_LIMIT) throw ABORT;
+            if (belief.length === 0) return 1;
+            if (round > TOTAL_ROUNDS) return 0;
+            const key = solverBeliefKey(belief, positions, round, acting);
+            if (memo.has(key)) return memo.get(key);
+            let best = -1;
+            for (const plan of solverCandidatePlans(belief, positions, acting, round)) {
+                const v = valueActions(belief, positions, plan, 0, round, acting, best);
+                if (v > best) best = v;
+                if (best >= 1) break;
+            }
+            const result = Math.max(0, best);
+            memo.set(key, result);
+            return result;
+        }
+
+        try {
+            // 最上位ラウンドだけ、プランと勝率を両方返す
+            let best = -1;
+            let bestPlan = null;
+            for (const plan of solverCandidatePlans(paths, startPositions, actingIdxs, S.currentRound)) {
+                const v = valueActions(paths, startPositions, plan, 0, S.currentRound, actingIdxs, best);
+                if (v > best) { best = v; bestPlan = plan; }
+                if (best >= 1) break;
+            }
+            if (!bestPlan) return null;
+            const map = new Map();
+            actingIdxs.forEach((hi, i) => {
+                if (bestPlan[i]) map.set(hi, { ...bestPlan[i], minimax: true, winProb: best });
+            });
+            return { plan: map, value: best };
+        } catch (e) {
+            if (e === ABORT) return null;
+            throw e;
+        }
+    }
+
+    /* ---------- 中盤2手先読み（タスク5: expectimax） ----------
+       候補プランを「今ラウンドの捜索結果分岐 → 犯人移動 → 次ラウンドの
+       最適割当捕捉見込み」まで実際に展開して評価する。情報利得は、痕跡分岐で
+       belief が絞られる効果として自然に価値へ入る。犯人移動は一様（expectimax）
+       とし、手詰まりは勝ちとして数える。 */
+    function lookaheadEvaluatePlan(paths, startPositions, actingIdxs, actions, round) {
+        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+        let calls = 0;
+        const CALL_LIMIT = 4000;
+
+        function leafAfterThief(belief, positions) {
+            // belief は犯人移動後の経路集合。捕捉見込みは [0,1] に正規化し、
+            // 発見・手詰まり（=1）と物差しをそろえる
+            const post = solverBeliefPost(belief);
+            const cap1 = assignmentCapture(positions, post);
+            const prop = analyzeConsistentPaths(belief).propagated;
+            const cap2 = assignmentCapture(positions, prop);
+            return (cap1 + MOVE_DISCOUNT * cap2) / (1 + MOVE_DISCOUNT);
+        }
+
+        function rec(belief, positions, k) {
+            if (++calls > CALL_LIMIT) return 0;
+            if (belief.length === 0) return 0;
+            if (k >= actions.length) {
+                if (round >= TOTAL_ROUNDS) return 0;
+                let trapped = 0;
+                const nextBelief = [];
+                for (const path of belief) {
+                    const endpoint = path[path.length - 1];
+                    const ex = endpoint % B_SIZE;
+                    const ey = (endpoint / B_SIZE) | 0;
+                    const visited = new Set(path);
+                    let hasMove = false;
+                    for (const [dx, dy] of dirs) {
+                        const nx = ex + dx;
+                        const ny = ey + dy;
+                        if (nx < 0 || ny < 0 || nx >= B_SIZE || ny >= B_SIZE) continue;
+                        const np = ny * B_SIZE + nx;
+                        if (visited.has(np)) continue;
+                        hasMove = true;
+                        nextBelief.push(path.concat(np));
+                    }
+                    if (!hasMove) trapped += 1;
+                }
+                if (nextBelief.length === 0) return WIN_VALUE;
+                const trapFraction = trapped / belief.length;
+                return trapFraction * WIN_VALUE
+                    + (1 - trapFraction) * leafAfterThief(nextBelief, positions);
+            }
+            const hi = actingIdxs[k];
+            const pos = positions[hi];
+            const action = actions[k];
+            if (action.type === 'wait') return rec(belief, positions, k + 1);
+            if (action.type === 'move') {
+                const t = action.target;
+                if (t.x < 0 || t.y < 0 || t.x >= I_SIZE || t.y >= I_SIZE) return -Infinity;
+                if (Math.abs(t.x - pos.x) + Math.abs(t.y - pos.y) !== 1) return -Infinity;
+                if (positions.some((p, pi) => pi !== hi && p.x === t.x && p.y === t.y)) return -Infinity;
+                const nextPositions = positions.slice();
+                nextPositions[hi] = { x: t.x, y: t.y };
+                return rec(belief, nextPositions, k + 1);
+            }
+            if (action.type === 'search') {
+                const t = action.target;
+                const adj = adjacentBuildings(pos.x, pos.y)
+                    .some(b => b.x === t.x && b.y === t.y);
+                if (!adj) return -Infinity;
+                const tci = t.y * B_SIZE + t.x;
+                const total = belief.length;
+                let hitCount = 0;
+                const branches = new Map();
+                for (const path of belief) {
+                    const endpoint = path[path.length - 1];
+                    if (endpoint === tci) { hitCount += 1; continue; }
+                    const ii = path.indexOf(tci);
+                    let cls;
+                    if (ii < 0 || ii >= path.length - 1) cls = 'empty';
+                    else if (ii === 0) cls = 'Y';
+                    else if (ii === 5) cls = 'R';
+                    else cls = 'B';
+                    if (!branches.has(cls)) branches.set(cls, []);
+                    branches.get(cls).push(path);
+                }
+                // 発見の価値には通常プランと同じ鮮度係数を掛け、捜索済みマスの
+                // 繰り返し捜索が先読みでも過大評価されないようにする
+                const freshness = searchFreshnessFactor(S.buildings[t.y][t.x]);
+                let acc = (hitCount / total) * WIN_VALUE * freshness;
+                for (const branch of branches.values()) {
+                    acc += (branch.length / total) * rec(branch, positions, k + 1);
+                }
+                return acc;
+            }
+            return -Infinity;
+        }
+
+        return rec(paths, startPositions, 0);
+    }
+
+    /* 通常プラン（planJointActions の結果）を含む候補を先読み評価し、
+       通常プランより十分に良いプランがあればその行動列を返す。 */
+    function chooseLookaheadPlan(remainingHelis, heuristicActions) {
+        if (S.currentRound < 2 || S.currentRound >= TOTAL_ROUNDS) return null;
+        const { paths } = getPathAnalysis(S);
+        if (!paths || paths.length === 0 || paths.length > LOOKAHEAD_MAX_PATHS) return null;
+        const actingIdxs = remainingHelis.map(h => h.index);
+        const startPositions = S.police.helis.map(h => ({ x: h.x, y: h.y }));
+
+        const candidates = [];
+        const seen = new Set();
+        const addCandidate = (actions) => {
+            if (!actions || actions.length !== actingIdxs.length) return;
+            const k = JSON.stringify(actions.map(a => `${a.type}:${a.target.x},${a.target.y}`));
+            if (!seen.has(k)) { seen.add(k); candidates.push(actions); }
+        };
+        addCandidate(heuristicActions.map(a => ({ type: a.type, target: { x: a.target.x, y: a.target.y } })));
+        const post = solverBeliefPost(paths);
+        addCandidate(solverGreedyPlan(paths, startPositions, actingIdxs, post));
+        const prop = analyzeConsistentPaths(paths).propagated;
+        addCandidate(solverGreedyPlan(paths, startPositions, actingIdxs, prop));
+
+        let heuristicValue = null;
+        let best = null;
+        let bestValue = -Infinity;
+        candidates.forEach((actions, i) => {
+            const v = lookaheadEvaluatePlan(paths, startPositions, actingIdxs, actions, S.currentRound);
+            if (i === 0) heuristicValue = v;
+            if (v > bestValue) { bestValue = v; best = actions; }
+        });
+        if (!best || heuristicValue === null) return null;
+        if (bestValue <= heuristicValue + LOOKAHEAD_MARGIN) return null;
+        // 先読みは移動回数を減らす方向には覆さない（ヘリが張り付く退行の防止）。
+        // 捜索先の改善や移動先の改善など、移動回数が同等以上の場合だけ採用する。
+        const countMoves = (actions) => actions.filter(a => a.type === 'move').length;
+        if (countMoves(best) < countMoves(candidates[0])) return null;
+        return best;
+    }
+
     function decidePoliceAction(heli) {
         if (!heli || heli.x == null || heli.hasActed) {
             return { type: 'wait', target: { x: heli ? heli.x : 0, y: heli ? heli.y : 0 } };
@@ -2246,6 +2561,12 @@
         const solverPlan = findForcedWinPlan(remaining);
         if (solverPlan && solverPlan.has(heli.index)) {
             return solverPlan.get(heli.index);
+        }
+
+        // 0.5) 終盤の勝率ミニマックス: 必勝はなくても勝率最大のプランを選ぶ
+        const minimax = minimaxEndgameSolve(remaining);
+        if (minimax && minimax.plan.has(heli.index)) {
+            return minimax.plan.get(heli.index);
         }
 
         // 1) このフェーズで候補全マスを覆えるなら必中プランを優先
@@ -2264,7 +2585,14 @@
             post,
             endgame.endgameActive ? endgame : null
         );
-        return plan.actions[0] || { type: 'wait', target: { x: heli.x, y: heli.y } };
+        let chosen = plan.actions[0] || { type: 'wait', target: { x: heli.x, y: heli.y } };
+
+        // 3) 中盤2手先読み: 通常プランより十分に良いプランがあれば差し替える
+        if (plan.actions && plan.actions.length === remaining.length) {
+            const lookahead = chooseLookaheadPlan(remaining, plan.actions);
+            if (lookahead && lookahead[0]) chosen = lookahead[0];
+        }
+        return chosen;
     }
 
     function cpuPoliceTurn() {
@@ -2517,6 +2845,9 @@
             getDecisionPosterior: () => getDecisionPosterior(S),
             assignmentCapture,
             findForcedWinPlan,
+            minimaxEndgameSolve,
+            lookaheadEvaluatePlan,
+            chooseLookaheadPlan,
         };
     }
 
@@ -2535,6 +2866,9 @@
             analyzeConsistentPaths,
             getPathAnalysis,
             assignmentCapture,
+            minimaxEndgameSolve,
+            lookaheadEvaluatePlan,
+            chooseLookaheadPlan,
         };
     }
 
