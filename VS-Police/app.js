@@ -1575,14 +1575,29 @@
         return enumerateMinimaxSetups().best;
     }
 
-    /* タスク3: 最適（maxSearch、次いで sumSearch が最良と同点）の配置が複数ある場合、
-       その中からシード付き乱数で1つ選ぶ。決定的配置だと犯人（人間）が毎回
-       「裏」の潜伏位置を選べてしまうため。 */
+    /* タスク3改: 完全な最適（maxSearch=2, sumSearch=14）は同点が4通りしかなく、
+       毎回ほぼ同じ配置に見える。そこで「最大捜索距離と即時捜索可能数は
+       最適のまま、合計捜索距離は最適+1まで」の準最適プール（32通り）から
+       シード付き乱数で一様に選ぶ。最悪到達距離と初手で捜せる範囲は
+       最適値を保つため弱い配置にはならず、平均到達距離の悪化も
+       1マスあたり最大 +0.04 に収まる（+2まで広げると実測で勝率が
+       下がったため +1 に抑えた）。あわせてヘリ（色）への割当順も
+       シャッフルし、見た目の繰り返しを減らす。 */
+    const SETUP_SUM_TOLERANCE = 1;
     function chooseRandomMinimaxHeliSetup() {
         const { all, best } = enumerateMinimaxSetups();
-        const ties = all.filter(c => c.maxSearch === best.maxSearch && c.sumSearch === best.sumSearch);
-        if (ties.length <= 1) return best;
-        return ties[randInt(ties.length)];
+        const pool = all.filter(c => c.maxSearch === best.maxSearch
+            && c.immediate === best.immediate
+            && c.sumSearch <= best.sumSearch + SETUP_SUM_TOLERANCE);
+        const chosen = pool.length > 0 ? pool[randInt(pool.length)] : best;
+        const combo = chosen.combo.slice();
+        for (let i = combo.length - 1; i > 0; i--) {
+            const j = randInt(i + 1);
+            const tmp = combo[i];
+            combo[i] = combo[j];
+            combo[j] = tmp;
+        }
+        return { ...chosen, combo };
     }
 
     function cpuSetupHeli() {
