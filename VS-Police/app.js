@@ -523,7 +523,7 @@
                 if (!heli) return who + '下のボタンでヘリを選択';
                 if (heli.hasActed) return who + 'このヘリは行動済みです。他のヘリを選択してください。';
                 if (heli.x == null) return who + 'ヘリを配置してください。';
-                return who + '🔵 光る交差点＝移動 ／ 🟡 光るビル＝捜索をタップ';
+                return who + '🟡 黄色く光る交差点＝移動 ／ 黄色く光るビル＝捜索をタップ';
             }
             case 'ROUND_THIEF': {
                 const moves = validCarMoves();
@@ -606,7 +606,7 @@
             if (!heli || heli.hasActed || heli.x == null) return;
             const moves = validHeliMoves(heli);
             if (!moves.some(m => m.x === ix && m.y === iy)) {
-                addLog('その交差点へは移動できません。🔵 光る交差点をタップしてください。', 'log-alert');
+                addLog('その交差点へは移動できません。🟡 黄色く光る交差点をタップしてください。', 'log-alert');
                 buzz([18, 26, 18]);
                 return;
             }
