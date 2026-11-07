@@ -1660,11 +1660,18 @@
             const cx = cxOf(p), cy = cyOf(p);
             if (idx > 0) {
                 const prev = pts[idx - 1];
+                const px = cxOf(prev), py = cyOf(prev);
+                // マーカー（半径11px）と数字に線がかぶらないよう、
+                // 線の両端を円の外側まで縮める
+                const dx = cx - px, dy = cy - py;
+                const len = Math.hypot(dx, dy) || 1;
+                const inset = 13; // 円の半径 + 余白
+                const ux = dx / len, uy = dy / len;
                 ctx.strokeStyle = '#ffd166';
                 ctx.lineWidth = 3;
                 ctx.beginPath();
-                ctx.moveTo(cxOf(prev), cyOf(prev));
-                ctx.lineTo(cx, cy);
+                ctx.moveTo(px + ux * inset, py + uy * inset);
+                ctx.lineTo(cx - ux * inset, cy - uy * inset);
                 ctx.stroke();
             }
             // この地点を離れたラウンド = idx+1 (初期地点は Round 1 で離脱)
