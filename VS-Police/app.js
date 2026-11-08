@@ -226,7 +226,7 @@
 
     function posteriorSignature(state) {
         const clues = (state.revealedClues || [])
-            .map(c => `${c.x},${c.y},${c.type}`)
+            .map(c => `${c.x},${c.y},${c.type},${c.foundRound == null ? '-' : c.foundRound}`)
             .sort()
             .join(';');
         const empties = (state.searchLog || [])
@@ -275,10 +275,15 @@
             if (c.type === 'YELLOW') allowedIndices = [0];
             else if (c.type === 'RED') allowedIndices = [5];
             else allowedIndices = [1, 2, 3, 4, 6, 7, 8, 9, 10];
+            // 痕跡を発見したラウンド r より前（index <= r-2）に置かれた
+            // 痕跡しか警察フェーズで見つからない。foundRound が無い古い
+            // データでは現在ラウンドで代用し、従来と同じ挙動にする。
+            const foundRound = Number.isFinite(c.foundRound) ? c.foundRound : state.currentRound;
+            const maxAllowedByFound = foundRound - 2;
             let mask = 0;
             let maxAllowed = -1;
             for (const i of allowedIndices) {
-                if (i <= maxIdx - 1) {
+                if (i <= maxIdx - 1 && i <= maxAllowedByFound) {
                     mask |= (1 << i);
                     if (i > maxAllowed) maxAllowed = i;
                 }
@@ -495,10 +500,12 @@
             if (c.type === 'YELLOW') allowedIndices = [0];
             else if (c.type === 'RED') allowedIndices = [5];
             else allowedIndices = [1, 2, 3, 4, 6, 7, 8, 9, 10];
+            const foundRound = Number.isFinite(c.foundRound) ? c.foundRound : state.currentRound;
+            const maxAllowedByFound = foundRound - 2;
             let mask = 0;
             let maxAllowed = -1;
             for (const i of allowedIndices) {
-                if (i <= maxIdx - 1) {
+                if (i <= maxIdx - 1 && i <= maxAllowedByFound) {
                     mask |= (1 << i);
                     if (i > maxAllowed) maxAllowed = i;
                 }
@@ -1190,7 +1197,9 @@
             addLog(`   → 痕跡「${clueLabel[b.clue]}」を発見!`, 'log-alert');
             buzz(50);
             if (!S.revealedClues.some(c => c.x === bx && c.y === by)) {
-                S.revealedClues.push({ x: bx, y: by, type: b.clue });
+                // 発見したラウンドを保持する（提案2）。青痕跡の経路インデックスは
+                // 「発見ラウンド - 2」以下に制限できるため、事後分布の精度が上がる。
+                S.revealedClues.push({ x: bx, y: by, type: b.clue, foundRound: S.currentRound });
             }
         } else {
             addLog(`   → 何もない (確定)。`, 'log-info');
@@ -1246,6 +1255,16 @@
                 if (S.mode === 'cpu') {
                     cpuThiefTurn(() => { S.transitioning = false; });
                 } else if (S.mode === 'cpu_police') {
+                    // 提案1: 犯人ソロでも手詰まり判定を行う。人間モードの
+                    // switchPhase('THIEF_WAIT') と同じ条件で、隣接する未訪問ビルが
+                    // 無ければ警察の勝利。これが無いと追い詰めても進行不能になる。
+                    if (validCarMoves().length === 0) {
+                        S.transitioning = false;
+                        addLog('⚠️ 逃走車は移動不可! 警察の勝利!', 'log-alert');
+                        S.winner = 'POLICE';
+                        endGame('POLICE');
+                        return;
+                    }
                     // ブラインドなしで直接犯人ターンへ
                     S.phase = 'ROUND_THIEF';
                     S.transitioning = false;
@@ -1640,6 +1659,11 @@
     const FORCED_COVER_BONUS = 0.30;     // 強制移動先を新たに捜索可能にする移動の価値
     const ENDGAME_SEARCH_BONUS = 0.35;   // 終盤で候補マスを捜索する価値
     const ENDGAME_MOVE_BONUS = 0.08;     // 終盤で候補マスに近づく移動の価値
+    // 痕跡未発見時の再捜索（提案3）。犯人は空振り後に同じビルへ再進入できるが、
+    // 未捜索マスより情報が少ないため、一定の条件を満たす場合だけ許可する。
+    const REPEAT_SEARCH_MIN_AGE = 2;     // 前回捜索から何ラウンド経過したら候補に戻すか
+    const REPEAT_SEARCH_RATIO = 1.05;    // 未捜索の最良候補に対して必要な価値の比率
+    const REPEAT_SEARCH_MIN_VALUE = 0.01; // これ未満の再捜索は無駄撃ちとみなす
     // タスク4: 終盤ソルバーの発動上限（経路数が多い序盤では読み切れないため）
     const SOLVER_MAX_PATHS = 500;
     const SOLVER_NODE_LIMIT = 30000;     // 探索ノード数の上限（超えたら諦めて通常評価へ）
@@ -1728,6 +1752,16 @@
     }
 
     const DECISION_POST_CACHE = { key: null, result: null };
+
+    /* ベンチマーク/テスト用: ゲーム間でキャッシュを持ち越さない。 */
+    function resetCaches() {
+        POSTERIOR_CACHE.key = null;
+        POSTERIOR_CACHE.result = null;
+        PATHS_CACHE.key = null;
+        PATHS_CACHE.result = null;
+        DECISION_POST_CACHE.key = null;
+        DECISION_POST_CACHE.result = null;
+    }
 
     /* 意思決定用の混合分布を作る（タスク3）。生の事後分布に
        visitProb / visitByIndex / infoGain と経路分析を付けて返す。 */
@@ -1882,21 +1916,39 @@
     /* 1機ぶんの候補手（捜索・移動）とその価値を列挙する。 */
     function generateHeliActions(heli, post, endgame) {
         const actions = [];
+        const repeatCandidates = [];
+        let bestFreshSearchValue = 0;
         for (const b of searchableBuildings(heli)) {
             if (b.x < 0 || b.y < 0 || b.x >= B_SIZE || b.y >= B_SIZE) continue;
             const building = S.buildings[b.y][b.x];
             if (building.clueRevealed) continue;          // 痕跡マスは現在位置になり得ない
             if (isSearchedThisRound(b.x, b.y)) continue;  // 同ラウンドの再捜索は無意味
             const ck = b.y * B_SIZE + b.x;
-            // 痕跡が1つも出ていない間は、捜索済みマスを再捜索しない。
-            // 未捜索マスは「過去に立ち寄ったか」の痕跡情報まで得られるが、
-            // 捜索済みマスは直後だと現在位置の確認にしかならず情報が増えない。
-            // カバー範囲を広げて最初の痕跡を引きにいく方針（tanaka の指定）。
-            // 終盤候補マス（現在位置候補として捜すマス）は対象外。
+            // 痕跡が1つも出ていない間は、捜索済みマスを即座に再捜索しない。
+            // ただし犯人は空振り後に同じビルへ再進入できるため、一定の条件を
+            // 満たす場合は再捜索を許可する（提案3）。未捜索マスを優先しつつ、
+            // 事後分布が十分高い再捜索だけを候補に残す。
             const isEndgameCandidate = !!(endgame && endgame.candidateKeys.has(ck));
-            if (building.isSearched && S.revealedClues.length === 0 && !isEndgameCandidate) continue;
             const value = searchValueForCell(ck, post, endgame);
+            if (building.isSearched && S.revealedClues.length === 0 && !isEndgameCandidate) {
+                repeatCandidates.push({
+                    type: 'search', target: { x: b.x, y: b.y }, cellKey: ck, value,
+                    searchedRound: building.searchedRound,
+                });
+                continue;
+            }
+            if (value > bestFreshSearchValue) bestFreshSearchValue = value;
             actions.push({ type: 'search', target: { x: b.x, y: b.y }, cellKey: ck, value });
+        }
+        // 再捜索候補は「前回捜索から2ラウンド以上」かつ「未捜索の最良候補を
+        // 上回る（または未捜索候補が無い）」場合だけ採用する。鮮度係数は
+        // searchValueForCell 内で既に掛かっているため、ここでは相対比較だけ行う。
+        for (const action of repeatCandidates) {
+            const age = S.currentRound - (action.searchedRound == null ? S.currentRound : action.searchedRound);
+            if (age < REPEAT_SEARCH_MIN_AGE) continue;
+            if (bestFreshSearchValue > 0 && action.value < bestFreshSearchValue * REPEAT_SEARCH_RATIO) continue;
+            if (action.value < REPEAT_SEARCH_MIN_VALUE) continue;
+            actions.push(action);
         }
 
         // タスク2: 移動価値 = 次ラウンド分布に対する最適割当発見確率の増分。
@@ -2587,6 +2639,47 @@
         return best;
     }
 
+    /* 提案7: 次に行動するヘリを選ぶ。
+       捜索で新しい情報を得られると後続の判断が良くなるため、捜索価値の
+       高いヘリを先に動かす。ただし終盤ソルバーが実際に起動し得る局面では、
+       ソルバーが remaining の順でプランを探索するため既定順を維持する。 */
+    function chooseNextHeli(remaining) {
+        if (!remaining || remaining.length === 0) return null;
+        if (remaining.length === 1) return remaining[0];
+        // 終盤ソルバー/勝率ミニマックスの発動条件（findForcedWinPlan /
+        // minimaxEndgameSolve と同じ判定）。単に経路数が少ないだけでは
+        // 発動しないため、条件を揃えて提案7の適用範囲を広げる。
+        const pathCount = getPathAnalysis(S).paths.length;
+        const rawPost = getPosterior(S);
+        const remainingPhases = TOTAL_ROUNDS - S.currentRound + 1;
+        const solverActive = pathCount <= SOLVER_MAX_PATHS
+            && (remainingPhases <= 4 || rawPost.cells.length <= 6 || pathCount <= 40);
+        if (solverActive) return remaining[0];
+
+        const post = getDecisionPosterior(S);
+        const endgame = buildEndgameContext(rawPost, remaining.length);
+        const endgameArg = endgame.endgameActive ? endgame : null;
+        let best = remaining[0];
+        let bestScore = -Infinity;
+        for (const heli of remaining) {
+            const actions = generateHeliActions(heli, post, endgameArg);
+            let bestSearch = -Infinity;
+            let bestMove = -Infinity;
+            for (const a of actions) {
+                if (a.type === 'search' && a.value > bestSearch) bestSearch = a.value;
+                else if (a.type === 'move' && a.value > bestMove) bestMove = a.value;
+            }
+            // 捜索と移動はスコアの意味が異なるため、捜索にごく小さな優先権を
+            // 与える。同点は remaining の順（= S.police.helis の順）で安定。
+            const score = Math.max(bestSearch + 0.01, bestMove);
+            if (score > bestScore + 1e-9) {
+                bestScore = score;
+                best = heli;
+            }
+        }
+        return best;
+    }
+
     function decidePoliceAction(heli) {
         if (!heli || heli.x == null || heli.hasActed) {
             return { type: 'wait', target: { x: heli ? heli.x : 0, y: heli ? heli.y : 0 } };
@@ -2639,16 +2732,17 @@
     function cpuPoliceTurn() {
         // 3機のヘリを順に行動させる (遅延付きで可視化)
         S.transitioning = true;
-        let heliIdx = 0;
         function nextHeli() {
             if (S.winner != null) { S.transitioning = false; return; }
-            if (heliIdx >= S.police.helis.length) {
+            // 提案7: 未行動ヘリの中から、捜索価値の高い機体を次に選ぶ。
+            const remaining = S.police.helis.filter(h => !h.hasActed && h.x != null);
+            if (remaining.length === 0) {
                 // 全機行動済 -> 犯人フェーズへ
                 S.transitioning = false;
                 maybeEndPolicePhase();
                 return;
             }
-            const heli = S.police.helis[heliIdx++];
+            const heli = chooseNextHeli(remaining) || remaining[0];
             S.police.selected = heli.index;
             render();
 
@@ -2885,6 +2979,9 @@
             thiefPosterior,
             inferredCandidates: () => inferredCandidates(S),
             decidePoliceAction,
+            chooseNextHeli,
+            maybeEndPolicePhase,
+            resetCaches,
             chooseMinimaxHeliSetup,
             chooseRandomMinimaxHeliSetup,
             searchDistanceForBuilding,
@@ -2901,7 +2998,8 @@
         };
     }
 
-    // Node からのユニットテスト用エクスポート（ブラウザでは無効）
+    // Node からのユニットテスト/自己対戦ベンチマーク用エクスポート
+    // （ブラウザでは無効）
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = {
             createState,
@@ -2919,6 +3017,22 @@
             minimaxEndgameSolve,
             lookaheadEvaluatePlan,
             chooseLookaheadPlan,
+            // ベンチマーク用の状態操作・意思決定API
+            setState: (state) => { S = state; },
+            getState: () => S,
+            resetCaches,
+            seedRandom,
+            decidePoliceAction,
+            chooseNextHeli,
+            generateHeliActions,
+            planJointActions,
+            buildEndgameContext,
+            getDecisionPosterior,
+            validCarMoves,
+            validHeliMoves,
+            searchableBuildings,
+            adjacentBuildings,
+            clueTypeForRound,
         };
     }
 
